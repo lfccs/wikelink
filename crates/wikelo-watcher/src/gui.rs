@@ -14,6 +14,7 @@ use eframe::egui::{self, Color32, RichText};
 use crate::agent::{self, AgentConfig, DaemonStatus};
 use crate::i18n::{self, Lang};
 use crate::palette::{ACCENT, BAD, BORDER, MUTED, NAVY, NAVY_DEEP, NAVY_RAISED, OK, TEXT, WARN};
+use crate::update;
 use crate::{tr, trf};
 
 /// Lines of the watcher log shown in the window.
@@ -36,6 +37,26 @@ enum Done {
     Update(Option<(String, String)>),
     /// The overlay was opened or closed.
     Overlay(Result<(), String>),
+    /// Where a confirmed update is (the text of `update::Stage`).
+    UpdateProgress(String),
+    /// The update ended: done, or why not.
+    Updated(Result<update::Finished, String>),
+}
+
+/// The "Update" button of the new-version banner, step by step. Nothing is downloaded before
+/// the player chooses "Update now" in `Confirm`.
+#[derive(Clone)]
+enum UpdateStep {
+    /// The banner offers the button.
+    Offer,
+    /// The confirmation: versions and source, "Update now" / "Cancel".
+    Confirm,
+    /// Downloading, checking, replacing (the stage is in `busy`).
+    Running,
+    /// It failed, and why.
+    Failed(String),
+    /// The file was replaced, but this window stays open: what the player should know.
+    Finished(String),
 }
 
 pub fn run() -> anyhow::Result<()> {
@@ -119,6 +140,9 @@ struct App {
     msg: Option<(bool, String)>,
     /// A newer release than this executable, as the daemon or the start-up check reported it.
     update: Option<(String, String)>,
+    update_step: UpdateStep,
+    /// The update started the new version's window: this one closes.
+    quit: bool,
     tx: Sender<Done>,
     rx: Receiver<Done>,
     /// Signed-in state the window is currently sized for.
@@ -149,6 +173,8 @@ impl App {
             busy: None,
             msg: None,
             update: None,
+            update_step: UpdateStep::Offer,
+            quit: false,
             tx,
             rx,
             sized_for,
@@ -199,7 +225,7 @@ impl App {
 
     fn drain(&mut self) {
         while let Ok(done) = self.rx.try_recv() {
-            self.busy = None;
+            let before = self.busy.take();
             match done {
                 Done::Login(Ok((handle, token, name))) => {
                     // The address the new token belongs to (see `agent::with_token_rule`).
@@ -270,9 +296,30 @@ impl App {
                     if u.is_some() {
                         self.update = u;
                     }
+                    // An update under way stays busy.
+                    if matches!(self.update_step, UpdateStep::Running) {
+                        self.busy = before;
+                    }
                     // Not a user action: the spinner belongs to the session check that preceded it.
                     continue;
                 }
+                Done::UpdateProgress(stage) => {
+                    // The update goes on: still busy, with the new stage as the label.
+                    self.busy = Some(stage);
+                    continue;
+                }
+                Done::Updated(Ok(f)) => {
+                    if f.window_opened {
+                        self.quit = true;
+                    } else {
+                        let v = &f.version;
+                        self.update_step = UpdateStep::Finished(match &f.problem {
+                            Some(p) => trf!("Wikelink was updated to {v}, but: {p}", "O Wikelink foi atualizado para a {v}, mas: {p}"),
+                            None => trf!("Wikelink was updated to {v}: open it again.", "O Wikelink foi atualizado para a {v}: abra-o de novo."),
+                        });
+                    }
+                }
+                Done::Updated(Err(e)) => self.update_step = UpdateStep::Failed(e),
             }
             self.poll();
         }
@@ -344,6 +391,19 @@ impl App {
                 return Done::Started(Err(format!("{e:#}")));
             }
             Done::Started(agent::start_background().map_err(|e| format!("{e:#}")))
+        });
+    }
+
+    /// "Update now", after the confirmation: `update::install` on a thread of its own, its
+    /// stages coming back as `Done::UpdateProgress`, the end as `Done::Updated`.
+    fn run_update(&mut self, version: String) {
+        self.update_step = UpdateStep::Running;
+        let tx = self.tx.clone();
+        self.spawn(&update::Stage::Downloading { done: 0, total: None }.text(), move || {
+            let report = |stage: update::Stage| {
+                let _ = tx.send(Done::UpdateProgress(stage.text()));
+            };
+            Done::Updated(update::install(&version, true, &report))
         });
     }
 
@@ -425,16 +485,73 @@ impl App {
             });
         });
         if let Some((version, url)) = self.update.clone() {
-            ui.horizontal(|ui| {
-                let mine = wikelo_core::PKG_VERSION;
-                ui.label(RichText::new(trf!("Wikelink {version} available (this is {mine})", "Versão {version} do Wikelink disponível (esta é a {mine})")).color(WARN));
-                // Only a page of this project's releases on GitHub; anything else: no button.
-                if let Some(link) = agent::openable_url(&url, agent::Link::Release)
-                    && ui.button(tr!("Open download", "Abrir download")).on_hover_text(link.clone()).clicked()
-                {
-                    let _ = open::that_detached(&link);
+            let mine = wikelo_core::PKG_VERSION;
+            // `Some` only for a plain release number newer than this one: the button's condition.
+            let target = update::target_version(&version, mine).ok();
+            // Only a page of this project's releases on GitHub; anything else: no button. Without
+            // one from the server, the release's own page (it is the way to update by hand).
+            let link = agent::openable_url(&url, agent::Link::Release).or_else(|| target.as_deref().and_then(|v| agent::openable_url(&update::release_page(v), agent::Link::Release)));
+            match self.update_step.clone() {
+                UpdateStep::Confirm => {
+                    egui::Frame::group(ui.style()).inner_margin(8.0).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(RichText::new(update::confirm_text(mine, &version)).color(TEXT));
+                        ui.label(
+                            RichText::new(tr!(
+                                "Wikelink in the background and the overlay stop for a moment; the new version opens by itself.",
+                                "O Wikelink em segundo plano e o overlay param por um momento; a versão nova abre sozinha."
+                            ))
+                            .color(MUTED)
+                            .small(),
+                        );
+                        ui.horizontal(|ui| {
+                            if ui.add_enabled(self.busy.is_none() && target.is_some(), egui::Button::new(tr!("Update now", "Atualizar agora"))).clicked()
+                                && let Some(v) = target.clone()
+                            {
+                                self.run_update(v);
+                            }
+                            if ui.button(tr!("Cancel", "Cancelar")).clicked() {
+                                self.update_step = UpdateStep::Offer;
+                            }
+                        });
+                    });
                 }
-            });
+                UpdateStep::Running => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(RichText::new(self.busy.clone().unwrap_or_default()).color(WARN));
+                    });
+                }
+                step => {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(trf!("Wikelink {version} available (this is {mine})", "Versão {version} do Wikelink disponível (esta é a {mine})")).color(WARN));
+                        if let Some(link) = &link
+                            && ui.button(tr!("Open download", "Abrir download")).on_hover_text(link.clone()).clicked()
+                        {
+                            let _ = open::that_detached(link);
+                        }
+                        if target.is_some()
+                            && !matches!(step, UpdateStep::Finished(_))
+                            && ui
+                                .add_enabled(self.busy.is_none(), egui::Button::new(tr!("Update", "Atualizar")))
+                                .on_hover_text(tr!("Asks first; nothing is downloaded before you confirm", "Pergunta antes; nada é baixado antes de você confirmar"))
+                                .clicked()
+                        {
+                            self.update_step = UpdateStep::Confirm;
+                        }
+                    });
+                    match &step {
+                        UpdateStep::Failed(e) => {
+                            ui.label(RichText::new(e).color(BAD));
+                            ui.label(RichText::new(tr!("To update by hand: Open download.", "Para atualizar à mão: Abrir download.")).color(MUTED).small());
+                        }
+                        UpdateStep::Finished(text) => {
+                            ui.label(RichText::new(text).color(OK));
+                        }
+                        _ => {}
+                    }
+                }
+            }
         }
         // Another version runs in the background: typically `wikelo-watcher.exe` still running
         // after the move to this executable. A restart runs this one instead.
@@ -708,6 +825,13 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain();
+        if self.quit {
+            // The update opened the new version's window.
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        } else if matches!(self.update_step, UpdateStep::Running) && ctx.input(|i| i.viewport().close_requested()) {
+            // Closing now could leave the files half swapped: the window waits for the update.
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
         if self.last_poll.elapsed() > Duration::from_secs(1) {
             self.poll();
         }

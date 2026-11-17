@@ -3,7 +3,8 @@
 //! Double-click (no arguments) opens the settings window (`gui`): account, start/stop,
 //! channel, start with Windows, game-data upload, activity. The subcommands do the same
 //! from a terminal or a script: `start`, `stop`, `status`, `autostart`, `watch`
-//! (foreground), `logout`, `bundle` (signed data package by hand). The remaining
+//! (foreground), `logout`, `update` (to the newest release, after asking), `bundle` (signed
+//! data package by hand). The remaining
 //! subcommands are developer tools.
 //!
 //! The command-line help (clap's derive texts) stays in English: it is fixed at compile
@@ -27,6 +28,7 @@ mod overlay_widgets;
 mod overlay_win;
 mod palette;
 mod tray;
+mod update;
 
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
@@ -95,6 +97,14 @@ enum Cmd {
     },
     /// Forget the saved session.
     Logout,
+    /// Update Wikelink to the newest release, after asking: downloads `wikelink.exe` from
+    /// the project's GitHub releases, checks it against that release's SHA256SUMS.txt and
+    /// replaces this file. Never runs by itself.
+    Update {
+        /// Accept without the question (for scripts): the answer is given here instead.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Open the in-game overlay (Alt+Shift+F9 shows / hides it, Shift+Tab toggles the
     /// interactive mode; the game must run in borderless window mode). It waits, hidden, for
     /// the game's window, and leaves with it.
@@ -207,6 +217,8 @@ fn main() -> anyhow::Result<()> {
     // The language of everything below, in every process this exe can be (settings window,
     // background watcher, overlay, each subcommand): `lang` in watcher.json, else Windows'.
     i18n::set(agent::lang_pref().as_deref());
+    // A `.old` / `.new` an earlier update left next to this executable goes (silently).
+    update::clean_leftovers();
     // Subcommands print; the window does not. We are a GUI executable, so a terminal that
     // launched us is attached by hand (pipes set up by a script are left alone). Not the
     // overlay: it is a window, and tied to a terminal's console it would close with it.
@@ -338,6 +350,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             eprintln!("{}", trf!("Wikelink session removed ({p}).", "sessão do Wikelink removida ({p})."));
             Ok(())
         }
+        Some(Cmd::Update { yes }) => update::command(yes),
         Some(Cmd::Overlay { preview }) => overlay::run(preview).inspect_err(|e| console::message_box(&format!("{e:#}"))),
         Some(Cmd::Bundle { channel, p4k, out, name }) => run_bundle(channel, p4k, out, name),
         Some(Cmd::Hash { channel, p4k }) => run_hash(channel, p4k),
@@ -475,7 +488,7 @@ fn run_hash(channel: Option<String>, p4k: Option<PathBuf>) -> anyhow::Result<()>
 
 fn run_dev(cmd: Cmd) -> anyhow::Result<()> {
     match cmd {
-        Cmd::Start { .. } | Cmd::Stop | Cmd::Status | Cmd::Watch { .. } | Cmd::Autostart { .. } | Cmd::Logout | Cmd::Overlay { .. } | Cmd::Bundle { .. } | Cmd::Hash { .. } => {
+        Cmd::Start { .. } | Cmd::Stop | Cmd::Status | Cmd::Watch { .. } | Cmd::Autostart { .. } | Cmd::Logout | Cmd::Update { .. } | Cmd::Overlay { .. } | Cmd::Bundle { .. } | Cmd::Hash { .. } => {
             unreachable!("handled in run")
         }
         Cmd::Installs => {

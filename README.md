@@ -25,7 +25,7 @@ It sends to Wikelist (`https://wikelist.net`), and nowhere else:
 - if you turn it on, the game data extracted from your install;
 - the overlay's changes you make yourself (quantities, pins, moves between locations).
 
-Your password is used once, to get a session token; only the token is kept, in `watcher.json` on your PC. Once a day Wikelink asks Wikelist which release is the newest and tells you when there is a newer one; it never downloads or installs anything by itself.
+Your password is used once, to get a session token; only the token is kept, in `watcher.json` on your PC. Once a day Wikelink asks Wikelist which release is the newest and tells you when there is a newer one; it never downloads or installs anything by itself (see *Updating*).
 
 ## Download and check
 
@@ -57,6 +57,7 @@ The same is available from a terminal:
 | `wikelink autostart on` / `off` | Start with Windows (an entry under `HKCU\…\Run`). |
 | `wikelink watch` | Runs in this console (Ctrl+C to quit), to see what happens. |
 | `wikelink logout` | Stops and forgets the session. |
+| `wikelink update [--yes]` | Updates to the newest release after asking (`--yes` answers for a script); says so when there is nothing newer. See *Updating*. |
 | `wikelink overlay [--preview]` | Opens the overlay (it shows with the game; `--preview` shows it now). |
 | `wikelink bundle` | Writes a game-data bundle by hand, next to the exe. |
 | `wikelink hash` | Extracts and prints the reproducible content hash of each installed channel, to compare with what the site shows. |
@@ -67,6 +68,18 @@ Leave the password out of the command line: `start` then asks for it, hidden. A 
 Wikelink talks only to `https://wikelist.net`; there is no setting for another address. For development only, the environment variable `WIKELINK_DEV_SERVER` points it at a server on this PC (`localhost`, `127.0.0.1` or `[::1]`, any port, e.g. `http://localhost:8787`); any other value is ignored, with a line in `watcher.log`. A session made on one of the two is never sent to the other: switching means signing in again.
 
 The extraction is deterministic: the same `Data.p4k` always gives the same dataset and the same `contentHash`, so anyone with the game can reproduce what was uploaded with `wikelink hash`.
+
+## Updating
+
+When a newer release exists, the settings window says so, with **Open download** (the release page) and **Update**. **Update** asks first: it names the installed version, the new one and where the file comes from, and nothing is downloaded or changed until you choose **Update now**; **Cancel** leaves everything as it was. Wikelink never updates by itself, and no setting makes it. In a terminal, `wikelink update` asks the same question (`--yes` is the answer given in advance, for scripts). The tray icon has no update action.
+
+What it does after you confirm:
+
+- downloads `wikelink.exe` and `SHA256SUMS.txt` of that release from `https://github.com/lfccs/wikelink/releases/download/v<version>/`. Wikelist only tells it the version number; the address is built into Wikelink, the version must be newer than the installed one, and redirects are followed only to GitHub's download hosts. These downloads carry no session token and no cookie;
+- checks that the SHA-256 of the file is the one `SHA256SUMS.txt` lists for `wikelink.exe`, and that it is a Windows program; otherwise it deletes the download and changes nothing;
+- stops Wikelink in the background and the overlay, renames the running file to `wikelink.exe.old`, puts the new one in its place (if that fails, the old name is put back) and starts it again. The next start deletes the `.old`.
+
+What the check proves: the file is the one published in that release of this repository, downloaded over HTTPS. It is not a code signature; for proof of which commit built it, see `gh attestation verify` in *Download and check*. If Wikelink's folder is not writable (say, under `Program Files`), it stops before downloading and says so: run Wikelink once as administrator, or download the file by hand.
 
 ## Build it yourself
 
@@ -94,3 +107,5 @@ MIT, see [LICENSE](LICENSE). Star Citizen® is a trademark of Cloud Imperium Gam
 ## Português
 
 O Wikelink (antes *Wikelist Watcher*, `wikelo-watcher.exe`) é o programa para Windows que lê o `Game.log` enquanto você joga e mantém sua conta no [Wikelist](https://wikelist.net) em dia, com um overlay opcional por cima do jogo. Ele só se comunica com `https://wikelist.net`. Ele aparece em português quando o Windows está em português (dá para escolher na janela de opções). Como baixar, usar e conferir o arquivo: veja o site, em **Dados → Watcher**, e a seção *Download and check* acima.
+
+**Atualizar:** quando sai uma versão nova, a janela de opções mostra **Atualizar**. Ele pergunta antes, dizendo a versão instalada, a nova e de onde o arquivo vem; nada é baixado nem trocado até você escolher **Atualizar agora**, e **Cancelar** deixa tudo como estava. O Wikelink nunca se atualiza sozinho. No terminal: `wikelink update` (`--yes` responde pela pergunta, para scripts). Ele baixa `wikelink.exe` e `SHA256SUMS.txt` da release deste repositório no GitHub (o Wikelist só informa o número da versão), confere o SHA-256 e se é um programa do Windows, e só então troca o arquivo e abre de novo; se algo falhar, o arquivo instalado fica como estava. Isso prova que o arquivo é o publicado nessa release, baixado por HTTPS; não é uma assinatura de código. Se a pasta do Wikelink não aceitar gravação, ele avisa antes de baixar: abra-o uma vez como administrador ou baixe à mão.

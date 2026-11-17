@@ -1187,6 +1187,12 @@ pub fn update_available(cfg: &AgentConfig) -> Option<(String, String)> {
     wikelo_core::version::is_newer(&r.version, PKG_VERSION).then_some((r.version, r.url))
 }
 
+/// The version number of the newest release the server knows of (`None`: it has not looked
+/// yet), for `wikelink update`. Asked without the session token; only the number is used.
+pub fn latest_version() -> Result<Option<String>, String> {
+    Client::new("", "").latest_release().map(|r| r.map(|l| l.version)).map_err(|e| format!("{e:?}"))
+}
+
 /// Exchange handle + password for a Wikelink session token, at [`server_address`] (the
 /// address the token then belongs to). Returns `(token, display name)`.
 pub fn login(handle: &str, password: &str) -> anyhow::Result<(String, String)> {
@@ -1216,8 +1222,9 @@ pub fn login(handle: &str, password: &str) -> anyhow::Result<(String, String)> {
 }
 
 /// The public repository Wikelink's releases are published from (the README's Releases
-/// link): the only place a "new version" link from the server may lead.
-const RELEASES_REPO: &str = "lfccs/wikelink";
+/// link): the only place a "new version" link from the server may lead, and the only place the
+/// updater (`update`) downloads from.
+pub(crate) const RELEASES_REPO: &str = "lfccs/wikelink";
 
 /// A web address taken apart: what Wikelink checks before it sends a request or hands a link
 /// to the system.
@@ -2168,8 +2175,19 @@ where
     S: AsRef<std::ffi::OsStr>,
 {
     let exe = std::env::current_exe()?;
+    spawn_detached(&exe, args, env)
+}
+
+/// [`spawn_self_detached`] for the executable at `exe` (the updater starts the file it just put
+/// in place by its path). The password of [`PASSWORD_ENV`] is never passed on.
+pub(crate) fn spawn_detached<I, S>(exe: &Path, args: I, env: Option<(&str, &str)>) -> anyhow::Result<()>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
     let mut cmd = std::process::Command::new(exe);
     cmd.args(args).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    cmd.env_remove(PASSWORD_ENV);
     if let Some((k, v)) = env {
         cmd.env(k, v);
     }
