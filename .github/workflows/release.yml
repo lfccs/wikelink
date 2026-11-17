@@ -1,0 +1,65 @@
+# Builds `wikelink.exe` (Wikelink) from this public source on GitHub's runners and publishes it
+# with its SHA-256 and a signed build attestation, so players can check that the file they
+# run is the one built from the tagged commit. The commit is stamped into the binary
+# (`wikelink hash` prints it) and the version the exe reports to the server is the
+# one in Cargo.toml, so the tag has to match it.
+#
+# To release: bump `version` in Cargo.toml, commit, then create a tag `vX.Y.Z` (GitHub →
+# Releases → "Draft a new release" with a new tag also works); the workflow attaches the exe,
+# SHA256SUMS.txt and the attestation to that release.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  watcher:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain (rust-toolchain.toml)
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Tag matches Cargo.toml
+        shell: pwsh
+        run: |
+          $v = (cargo pkgid -p wikelo-watcher) -replace '.*[#@]', ''
+          if ("v$v" -ne $env:GITHUB_REF_NAME) { Write-Error "tag $env:GITHUB_REF_NAME, but Cargo.toml says $v"; exit 1 }
+          "version $v"
+      - name: Build
+        run: cargo build --release --locked -p wikelo-watcher --bin wikelink
+      - name: Checksums
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target\release\wikelink.exe dist\
+          $h = (Get-FileHash dist\wikelink.exe -Algorithm SHA256).Hash.ToLower()
+          "$h  wikelink.exe" | Out-File -Encoding ascii dist\SHA256SUMS.txt
+          Get-Content dist\SHA256SUMS.txt
+      - name: Build provenance (signed by GitHub; verify with `gh attestation verify`)
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/wikelink.exe
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/wikelink.exe
+            dist/SHA256SUMS.txt
+          body: |
+            `wikelink.exe` (Wikelink), built by GitHub Actions from this commit.
+            Check the download: `Get-FileHash wikelink.exe -Algorithm SHA256` must match `SHA256SUMS.txt`,
+            and `gh attestation verify .\wikelink.exe --repo lfccs/wikelink` confirms this repository built it.
+            `wikelink hash` shows the embedded commit and the hash of the extracted data; `wikelink status` shows the version.
+            Upgrading from `wikelo-watcher.exe`: open `wikelink.exe` once; it takes over the sign-in, the settings and "start with Windows". The old file can then be deleted.
+
+            `wikelink.exe` (Wikelink), compilado pelo GitHub Actions a partir deste commit.
+            Confira o arquivo baixado: `Get-FileHash wikelink.exe -Algorithm SHA256` deve bater com `SHA256SUMS.txt`,
+            e `gh attestation verify .\wikelink.exe --repo lfccs/wikelink` confirma que foi este repositório que o compilou.
+            Vindo do `wikelo-watcher.exe`: abra o `wikelink.exe` uma vez; ele assume a conta, as opções e o "iniciar com o Windows". Depois o arquivo antigo pode ser apagado.

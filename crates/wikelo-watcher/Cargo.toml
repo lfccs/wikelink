@@ -1,0 +1,63 @@
+[package]
+name = "wikelo-watcher"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = ["gui"]
+# The settings window (`wikelink` without arguments). Off when the crate is used as a library.
+gui = ["dep:eframe", "dep:open"]
+
+# The program players run: `wikelink.exe` (Wikelink). The package keeps its old name.
+[[bin]]
+name = "wikelink"
+path = "src/main.rs"
+required-features = ["gui"]
+
+[dependencies]
+eframe = { version = "0.32", optional = true }
+open = { version = "5", optional = true }
+wikelo-core = { path = "../wikelo-core" }
+wikelo-install = { path = "../wikelo-install" }
+wikelo-log = { path = "../wikelo-log" }
+starbreaker-p4k = { workspace = true }
+starbreaker-datacore = { workspace = true }
+starbreaker-common = { workspace = true }
+starbreaker-dds = { workspace = true }
+starbreaker-3d = { workspace = true }
+starbreaker-cryxml = { workspace = true }
+image = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+time = { workspace = true, features = ["local-offset"] }
+anyhow = { workspace = true }
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "fast"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+base64 = "0.22"
+sha2 = "0.10"
+# Deflate only, pure Rust (zlib-rs); no encryption, no other codecs.
+zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+directories = "6"
+ureq = { version = "3", features = ["json"] }
+rpassword = "7"
+ctrlc = "3"
+
+[target.'cfg(windows)'.dependencies]
+# Win32_Security: CreateMutexW's signature (the overlay's single-instance mutex, the watcher.json lock); Win32_Graphics_Gdi: the overlay's monitor
+# (MonitorFromWindow, GetMonitorInfoW); Win32_UI_Input_KeyboardAndMouse: hotkeys, GetAsyncKeyState, SetFocus;
+# Win32_UI_Shell: Wikelink's tray icon (Shell_NotifyIconW); Win32_System_LibraryLoader: GetModuleHandleW for its window class.
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Security", "Win32_System_Threading", "Win32_System_Console", "Win32_Storage_FileSystem", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_System_LibraryLoader"] }
+
+# The executable's icon and version resource (build.rs). Conditioned on the HOST, so a Linux build of the
+# library never compiles it.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
+[dev-dependencies]
+tempfile = "3"

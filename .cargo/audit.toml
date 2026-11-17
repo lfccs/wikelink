@@ -1,0 +1,21 @@
+# cargo-audit policy (CI runs `cargo audit` on both lockfiles). A vulnerability fails the build
+# unless listed here with a reason; "unmaintained" advisories only warn.
+[advisories]
+ignore = [
+    # quick-xml 0.37 (RUSTSEC-2026-0194 quadratic attribute check, RUSTSEC-2026-0195 NsReader
+    # allocation): pulled in only by StarBreaker (pinned git rev, requires ^0.37), which uses it
+    # to read the material XML of the player's own Data.p4k and to write XML exports. Wikelink
+    # only feeds it the game's own files on the player's PC. Revisit when StarBreaker moves to >= 0.41.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+    # zstd 0.13.3 / zstd-safe 7.3.0 (RUSTSEC-2026-0391 abandoned stream leaking into the next
+    # one on a reused context, RUSTSEC-2026-0398 `Seekable::decompress`, RUSTSEC-2026-0403
+    # uninitialized memory when streaming decompression of a legacy frame fails): pulled in only
+    # by StarBreaker (pinned git rev, requires ^0.13; the fixes are in 0.14.3 / 8.2.0), which
+    # decompresses each Data.p4k entry with a fresh `copy_decode` (no reused context, no
+    # Seekable, no dictionaries) and reads the player's own game files on their own machine. Revisit when the StarBreaker rev is bumped (main moved to
+    # structured-zstd).
+    "RUSTSEC-2026-0391",
+    "RUSTSEC-2026-0398",
+    "RUSTSEC-2026-0403",
+]

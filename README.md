@@ -1,0 +1,96 @@
+# Wikelink
+
+Wikelink (`wikelink.exe`) is the Windows program that runs on the PC where you play Star Citizen and keeps your account on [Wikelist](https://wikelist.net) (a fan-made tracker for **Wikelo**'s contracts) up to date. It was called *Wikelist Watcher* (`wikelo-watcher.exe`) before.
+
+It does three things:
+
+- **Reads the game's `Game.log`** while you play and sends your mission events to your account (Wikelo contracts accepted, delivered, completed, the end of other missions that pay items the site tracks, and where you are). The site updates your inventory and completions by itself.
+- **Shows an overlay** over the game (optional): your pinned items, what is still missing, what is stored where you are, recent records, and a search.
+- **Sends the game data** when a new game version comes out (optional): it extracts contracts, items and icons from the installed `Data.p4k` and uploads a bundle.
+
+This repository is public so that anyone can read what the program does and check that the published executable was built from this code. Wikelink is in English, or in Portuguese when Windows is; the settings window lets you choose.
+
+## What it reads and what it sends
+
+On your PC it reads:
+
+- the game's `Game.log` (and, for the optional game-data upload, the game's `Data.p4k` and `build_manifest.id`), found in the usual install folders;
+- its own files in `%LOCALAPPDATA%\wikelo-sc\data\` (`watcher.json` with your session and settings, `watcher.status.json`, `watcher.log`).
+
+It never opens, injects into or hooks the game process. The overlay is a separate transparent window, like any always-on-top app, and finds the game by its window title; the game must run in **borderless window** mode. The overlay's shortcuts (`Shift+Tab`, `Alt+Shift+F9`) are read by polling the key state, not with a hook.
+
+It sends to Wikelist (`https://wikelist.net`), and nowhere else:
+
+- mission events from the `Game.log`, including the character name the log shows, plus a heartbeat with this PC's name, the channel (LIVE, PTU…) and Wikelink's version;
+- if you turn it on, the game data extracted from your install;
+- the overlay's changes you make yourself (quantities, pins, moves between locations).
+
+Your password is used once, to get a session token; only the token is kept, in `watcher.json` on your PC. Once a day Wikelink asks Wikelist which release is the newest and tells you when there is a newer one; it never downloads or installs anything by itself.
+
+## Download and check
+
+[Releases](https://github.com/lfccs/wikelink/releases) has `wikelink.exe` and `SHA256SUMS.txt`, both made by GitHub Actions from the tag ([`.github/workflows/release.yml`](.github/workflows/release.yml)). After downloading:
+
+```powershell
+Get-FileHash .\wikelink.exe -Algorithm SHA256                         # must match SHA256SUMS.txt
+gh attestation verify .\wikelink.exe --repo lfccs/wikelink   # GitHub signs every build (needs the GitHub CLI)
+.\wikelink.exe hash      # prints the commit built into the binary
+.\wikelink.exe status    # prints the version and says when a newer one exists
+```
+
+The exe has no code signature (SmartScreen may warn on the first run: *More info → Run anyway*); the attestation above is the proof of origin.
+
+**Coming from `wikelo-watcher.exe`:** open `wikelink.exe` once. It uses the same session and settings, moves "Start with Windows" over to itself (the old entry is removed, so the two never start together) and offers to restart the background copy if the old one is still running. The old file is not touched; delete it when you like.
+
+## Using it
+
+Double-click opens the **settings window**: sign in with your site account, start / stop, the channel to follow, **Start with Windows**, the game-data upload, the overlay and the language. Once signed in, Wikelink runs in the background and the window can be closed. In the background it keeps an icon in the notification area: hover for its state, double-click for the settings, right-click for the site, the overlay and **Quit**.
+
+The same is available from a terminal:
+
+| Command | What it does |
+|---|---|
+| `wikelink` | Opens the settings window. |
+| `wikelink start [--handle X --share-data true\|false --quiet]` | Sets up what is missing (asks) and leaves Wikelink running in the background. |
+| `wikelink stop` | Stops it (and the overlay). |
+| `wikelink status` | Version, running or not, server / account / channel, last contact, last version check. |
+| `wikelink autostart on` / `off` | Start with Windows (an entry under `HKCU\…\Run`). |
+| `wikelink watch` | Runs in this console (Ctrl+C to quit), to see what happens. |
+| `wikelink logout` | Stops and forgets the session. |
+| `wikelink overlay [--preview]` | Opens the overlay (it shows with the game; `--preview` shows it now). |
+| `wikelink bundle` | Writes a game-data bundle by hand, next to the exe. |
+| `wikelink hash` | Extracts and prints the reproducible content hash of each installed channel, to compare with what the site shows. |
+| `wikelink installs` / `extract` / `dump` / `p4k-ls` | Extraction tools for looking at the game data. |
+
+Leave the password out of the command line: `start` then asks for it, hidden. A password typed as `--password` stays in the shell's history; a script that has to pass one can set the `WIKELINK_PASSWORD` environment variable instead (`--password` still works, but is the least safe of the three).
+
+Wikelink talks only to `https://wikelist.net`; there is no setting for another address. For development only, the environment variable `WIKELINK_DEV_SERVER` points it at a server on this PC (`localhost`, `127.0.0.1` or `[::1]`, any port, e.g. `http://localhost:8787`); any other value is ignored, with a line in `watcher.log`. A session made on one of the two is never sent to the other: switching means signing in again.
+
+The extraction is deterministic: the same `Data.p4k` always gives the same dataset and the same `contentHash`, so anyone with the game can reproduce what was uploaded with `wikelink hash`.
+
+## Build it yourself
+
+```powershell
+rustup show                                                  # installs the version pinned in rust-toolchain.toml
+cargo build --release --locked -p wikelo-watcher --bin wikelink
+# target\release\wikelink.exe
+```
+
+`Data.p4k` / DataForge are read with [StarBreaker](https://github.com/diogotr7/StarBreaker) (MIT), pinned to a commit in `Cargo.toml`.
+
+| Crate | What it does |
+|---|---|
+| `crates/wikelo-watcher` | The program (`wikelink.exe`): window, background watcher, overlay, extraction, bundles. |
+| `crates/wikelo-core` | Dataset types, calculations, canonical hash and validation rules. |
+| `crates/wikelo-install` | Finds the game installs (`LIVE`, `PTU`, …) and reads `build_manifest.id`. |
+| `crates/wikelo-log` | `Game.log` parser, per-mission state machine, log tailer. |
+
+The crate and folder names keep the old `wikelo-*` names.
+
+## Licence
+
+MIT, see [LICENSE](LICENSE). Star Citizen® is a trademark of Cloud Imperium Games; this is a personal fan project, not affiliated with it.
+
+## Português
+
+O Wikelink (antes *Wikelist Watcher*, `wikelo-watcher.exe`) é o programa para Windows que lê o `Game.log` enquanto você joga e mantém sua conta no [Wikelist](https://wikelist.net) em dia, com um overlay opcional por cima do jogo. Ele só se comunica com `https://wikelist.net`. Ele aparece em português quando o Windows está em português (dá para escolher na janela de opções). Como baixar, usar e conferir o arquivo: veja o site, em **Dados → Watcher**, e a seção *Download and check* acima.
