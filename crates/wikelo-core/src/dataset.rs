@@ -71,7 +71,16 @@ pub struct ExtractorInfo {
     pub dcb_sha256: String,
     /// SHA-256 of `Data\Localization\english\global.ini`.
     pub ini_sha256: String,
+    /// [`EXTRACTOR_REVISION`] of the extractor that made it (0: made before revisions existed).
+    #[serde(default)]
+    pub revision: u32,
 }
+
+/// What generation of data this extractor writes. It goes up by one whenever the extractor
+/// starts writing something it did not write before (a new field, a corrected one), and is
+/// what decides whether a copy made earlier is worth replacing: the program's own version
+/// says nothing about the data. 2: locations.
+pub const EXTRACTOR_REVISION: u32 = 2;
 
 /// One item reward of a non-Wikelo mission, with the quantity from the game data.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

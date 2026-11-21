@@ -838,6 +838,10 @@ struct KnownDataset {
     /// recorded one, or is too old to say).
     #[serde(default)]
     extractor: Option<String>,
+    /// `EXTRACTOR_REVISION` of the newest copy there (0: made before revisions existed;
+    /// `None`: the server does not say).
+    #[serde(default)]
+    revision: Option<u32>,
 }
 
 /// Why a build installed here goes to the server.
@@ -855,12 +859,20 @@ enum UploadReason {
 /// server already has. One copy made by this extractor or a newer one, in use yet or not,
 /// settles it: our own earlier upload counts, so there is no re-sending loop. An extractor
 /// version that does not parse counts as current, never as old.
-fn upload_reason(known: &[KnownDataset], channel: &str, version: &str, mine: &str) -> Option<UploadReason> {
+///
+/// What is compared is the extractor's revision (`wikelo_core::EXTRACTOR_REVISION`), which only
+/// changes when the data it writes does; the program's version decides only when the answer
+/// carries no revision at all.
+fn upload_reason(known: &[KnownDataset], channel: &str, version: &str, mine: &str, mine_revision: u32) -> Option<UploadReason> {
     let copies: Vec<&KnownDataset> = known.iter().filter(|k| k.channel.eq_ignore_ascii_case(channel) && k.version == version).collect();
     if copies.is_empty() {
         return Some(UploadReason::New);
     }
-    if copies.iter().any(|k| k.extractor.as_deref().is_some_and(|v| !wikelo_core::version::is_newer(mine, v))) {
+    if copies.iter().any(|k| k.revision.is_some()) {
+        if copies.iter().any(|k| k.revision.is_some_and(|r| r >= mine_revision)) {
+            return None;
+        }
+    } else if copies.iter().any(|k| k.extractor.as_deref().is_some_and(|v| !wikelo_core::version::is_newer(mine, v))) {
         return None;
     }
     let newest = copies.iter().filter_map(|k| k.extractor.as_deref()).fold(None::<&str>, |best, v| match best {
@@ -1576,7 +1588,7 @@ fn data_check(client: &Client, name: &str, handle: &str) -> String {
     for install in installs {
         let channel = install.channel.to_ascii_uppercase();
         let version = install.manifest.version.clone();
-        let Some(reason) = upload_reason(&known, &channel, &version, PKG_VERSION) else { continue };
+        let Some(reason) = upload_reason(&known, &channel, &version, PKG_VERSION, wikelo_core::EXTRACTOR_REVISION) else { continue };
         let why = match reason {
             UploadReason::New => trf!("{channel} {version} is not on the server", "{channel} {version} não existe no servidor"),
             UploadReason::OlderExtractor(Some(old)) => trf!(
@@ -2456,18 +2468,24 @@ mod tests {
 
     #[test]
     fn uploads_new_versions_and_copies_from_older_extractors() {
-        let k = |channel: &str, version: &str, extractor: Option<&str>| KnownDataset { channel: channel.into(), version: version.into(), extractor: extractor.map(str::to_string) };
+        let k = |channel: &str, version: &str, extractor: Option<&str>| KnownDataset { channel: channel.into(), version: version.into(), extractor: extractor.map(str::to_string), revision: None };
         let known = vec![k("LIVE", "4.10.1", None), k("LIVE", "4.10.2", Some("0.2.0")), k("PTU", "4.11.0", Some("0.2.1")), k("LIVE", "4.10.3", Some("0.2.0")), k("LIVE", "4.10.3", Some("0.2.1"))];
-        assert_eq!(upload_reason(&known, "LIVE", "4.10.9", "0.2.1"), Some(UploadReason::New), "a version the server lacks");
-        assert_eq!(upload_reason(&known, "LIVE", "4.10.1", "0.2.1"), Some(UploadReason::OlderExtractor(None)), "the server cannot say which extractor made its copy");
-        assert_eq!(upload_reason(&known, "LIVE", "4.10.2", "0.2.1"), Some(UploadReason::OlderExtractor(Some("0.2.0".into()))));
-        assert_eq!(upload_reason(&known, "live", "4.10.2", "0.2.0"), None, "same extractor: nothing to add (channel case does not matter)");
-        assert_eq!(upload_reason(&known, "PTU", "4.11.0", "0.2.1"), None);
-        assert_eq!(upload_reason(&known, "PTU", "4.11.0", "0.1.9"), None, "the server is ahead: never downgrade it");
-        assert_eq!(upload_reason(&known, "LIVE", "4.10.3", "0.2.1"), None, "one up-to-date copy (our own pending upload) is enough");
-        assert_eq!(upload_reason(&known, "LIVE", "4.10.3", "0.2.2"), Some(UploadReason::OlderExtractor(Some("0.2.1".into()))), "names the newest copy");
+        assert_eq!(upload_reason(&known, "LIVE", "4.10.9", "0.2.1", 2), Some(UploadReason::New), "a version the server lacks");
+        assert_eq!(upload_reason(&known, "LIVE", "4.10.1", "0.2.1", 2), Some(UploadReason::OlderExtractor(None)), "the server cannot say which extractor made its copy");
+        assert_eq!(upload_reason(&known, "LIVE", "4.10.2", "0.2.1", 2), Some(UploadReason::OlderExtractor(Some("0.2.0".into()))));
+        assert_eq!(upload_reason(&known, "live", "4.10.2", "0.2.0", 2), None, "same extractor: nothing to add (channel case does not matter)");
+        assert_eq!(upload_reason(&known, "PTU", "4.11.0", "0.2.1", 2), None);
+        assert_eq!(upload_reason(&known, "PTU", "4.11.0", "0.1.9", 2), None, "the server is ahead: never downgrade it");
+        assert_eq!(upload_reason(&known, "LIVE", "4.10.3", "0.2.1", 2), None, "one up-to-date copy (our own pending upload) is enough");
+        assert_eq!(upload_reason(&known, "LIVE", "4.10.3", "0.2.2", 2), Some(UploadReason::OlderExtractor(Some("0.2.1".into()))), "names the newest copy");
+        // A server that tells revisions: only they decide, whatever the program versions say.
+        let r = |extractor: &str, revision: u32| vec![KnownDataset { revision: Some(revision), ..k("LIVE", "4.10.2", Some(extractor)) }];
+        assert_eq!(upload_reason(&r("1.1.0", 0), "LIVE", "4.10.2", "0.1.0", 2), Some(UploadReason::OlderExtractor(Some("1.1.0".into()))), "an older revision from a higher program version is still older");
+        assert_eq!(upload_reason(&r("0.1.0", 2), "LIVE", "4.10.2", "0.1.0", 2), None, "same revision: nothing to add");
+        assert_eq!(upload_reason(&r("0.0.9", 3), "LIVE", "4.10.2", "0.1.0", 2), None, "the server is ahead: never downgrade it");
+        assert_eq!(upload_reason(&r("0.1.0", 2), "LIVE", "4.10.2", "9.0.0", 2), None, "a newer program with the same revision sends nothing");
         let odd = vec![k("LIVE", "4.10.2", Some("dev"))];
-        assert_eq!(upload_reason(&odd, "LIVE", "4.10.2", "0.2.1"), None, "an unparsable version counts as current, never as old");
+        assert_eq!(upload_reason(&odd, "LIVE", "4.10.2", "0.2.1", 2), None, "an unparsable version counts as current, never as old");
     }
 
     #[test]

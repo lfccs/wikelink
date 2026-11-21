@@ -15,9 +15,9 @@ This repository is public so that anyone can read what the program does and chec
 On your PC it reads:
 
 - the game's `Game.log` (and, for the optional game-data upload, the game's `Data.p4k` and `build_manifest.id`), found in the usual install folders;
-- its own files in `%LOCALAPPDATA%\wikelo-sc\data\` (`watcher.json` with your session and settings, `watcher.status.json`, `watcher.log`).
+- its own files in `%LOCALAPPDATA%\wikelo-sc\data\` (`watcher.json` with your session and settings, `watcher.status.json`, `watcher.log`, and `overlay.log`, where the overlay notes what Windows answered each time it was asked to open; it stays on your PC).
 
-It never opens, injects into or hooks the game process. The overlay is a separate transparent window, like any always-on-top app, and finds the game by its window title; the game must run in **borderless window** mode. The overlay's shortcuts (`Shift+Tab`, `Alt+Shift+F9`) are read by polling the key state, not with a hook.
+It never opens, injects into or hooks the game process. The overlay is a separate transparent window, like any always-on-top app, and finds the game by its window title; the game must run in **borderless window** mode. The overlay's shortcuts (`Shift+Tab`, `Alt+Shift+F9`) are read by polling the key state, not with a hook. It never synthesizes a key press, a click or a mouse movement; when Windows refuses to bring the overlay to the front on `Shift+Tab`, it sends one empty input event (a mouse event with no movement and no button) and asks again.
 
 It sends to Wikelist (`https://wikelist.net`), and nowhere else:
 

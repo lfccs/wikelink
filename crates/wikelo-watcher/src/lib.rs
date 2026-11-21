@@ -159,6 +159,7 @@ pub fn extract(install: &InstallInfo, on_progress: &dyn Fn(ExtractProgress)) -> 
         commit: wikelo_core::GIT_COMMIT.into(),
         dcb_sha256: wikelo_core::sha256_hex(&data.dcb),
         ini_sha256: wikelo_core::sha256_hex(&data.ini),
+        revision: wikelo_core::EXTRACTOR_REVISION,
     });
     report("normalize", 85, format!("{} contratos, {} itens", dataset.contracts.len(), dataset.items.len()));
 

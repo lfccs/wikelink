@@ -22,6 +22,7 @@ mod hotkey;
 mod i18n;
 mod overlay;
 mod overlay_game;
+mod overlay_log;
 mod overlay_model;
 mod overlay_sync;
 mod overlay_widgets;

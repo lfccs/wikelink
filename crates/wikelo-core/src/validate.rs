@@ -663,7 +663,7 @@ mod tests {
             mission_drops: vec![],
             missions: vec![],
             locations: vec![location("Stanton2_Orison", "Orison"), location("RR_CRU_LEO", "Seraphim Station")],
-            extractor: Some(ExtractorInfo { name: "wikelo-watcher".into(), version: "0.1.0".into(), commit: "dev".into(), dcb_sha256: "a".into(), ini_sha256: "b".into() }),
+            extractor: Some(ExtractorInfo { name: "wikelo-watcher".into(), version: "0.1.0".into(), commit: "dev".into(), dcb_sha256: "a".into(), ini_sha256: "b".into(), revision: 0 }),
         }
     }
 

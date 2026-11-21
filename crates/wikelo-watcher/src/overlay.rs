@@ -84,6 +84,7 @@ use eframe::egui::{self, Color32, RichText};
 use crate::agent::{self, ApiRequest, Client, OverlayWidget};
 use crate::hotkey::{self, HotkeyEvent, Hotkeys};
 use crate::overlay_game::{self, Life};
+use crate::overlay_log;
 use crate::overlay_model::{self as model, Local, OverlayData, OverlayIndex};
 use crate::overlay_sync::{self as sync, Job, Limit, Outcome, WriteEffect, WriteResult};
 use crate::overlay_widgets::{self as widgets, CardPlace, EscStep, Filter, Group, InventoryFetch, Layout, Listing, LocationsFetch, Part, Search, SearchAnswer, Shown, Toast, Toasts, Widget};
@@ -405,6 +406,15 @@ fn show(preview: bool) -> (Arc<Life>, Ran) {
     // The window the watch thread follows: a new game window later is another game.
     let followed = game.map(os::follow);
     let monitor = target_monitor(game);
+    overlay_log::line(format_args!(
+        "overlay started: Wikelink {} ({}) pid={} elevated={:?} preview={preview} | game window: {} | monitor: {:?}",
+        wikelo_core::PKG_VERSION,
+        wikelo_core::GIT_COMMIT,
+        std::process::id(),
+        os::elevated(),
+        os::describe_window(game),
+        os::monitor_rect(monitor)
+    ));
     let viewport = egui::ViewportBuilder::default()
         .with_title(TITLE)
         // Small until the first frames make it cover the monitor (`Overlay::place`).
@@ -880,6 +890,8 @@ struct Overlay {
     toasts: Toasts,
     /// Take the focus on the next frame (the window has just stopped ignoring the mouse).
     focus_next: bool,
+    /// When Shift+Tab last asked to open (for `overlay.log`: how long until the focus was asked for).
+    open_asked: Option<Instant>,
     /// The window that had the focus before the overlay opened: it gets it back on close.
     prev_focus: Option<PrevFocus>,
     /// The window has had the focus since it opened; losing it afterwards closes it.
@@ -1093,6 +1105,7 @@ impl Overlay {
             committed: false,
             toasts: Toasts::default(),
             focus_next: false,
+            open_asked: None,
             prev_focus: None,
             focus_seen: false,
             last_stop_check: Instant::now(),
@@ -1164,12 +1177,14 @@ impl Overlay {
                     }
                 }
                 HotkeyEvent::ToggleInteractive => {
+                    overlay_log::line(format_args!("Shift+Tab: open={} opening={} visible={} | in front: {}", self.open, self.opening.is_some(), self.visible, os::describe_foreground()));
                     if self.open {
                         self.set_open(ctx, false);
                     } else if self.opening.is_some() {
                         // Pressed again before the window got there: never mind.
                         self.opening = None;
                     } else {
+                        self.open_asked = Some(Instant::now());
                         self.start_opening(ctx);
                     }
                 }
@@ -1601,10 +1616,12 @@ impl Overlay {
         let game = os::game_window();
         // Off preview the overlay opens only over the game (without it, it is about to leave).
         if !self.preview && game.is_none() {
+            overlay_log::line(format_args!("not opening: no game window"));
             return;
         }
         // Shift+Tab is everybody's key: it opens the overlay only while the game is in front.
         if !self.preview && !game.is_some_and(os::is_foreground) {
+            overlay_log::line(format_args!("not opening: the game ({}) is not in front", os::describe_window(game)));
             return;
         }
         self.set_visible(true);
@@ -1697,6 +1714,8 @@ impl Overlay {
             return;
         }
         let got = os::take_focus(self.window);
+        let waited = self.open_asked.take().map_or("?".to_string(), |t| format!("{}ms", t.elapsed().as_millis()));
+        overlay_log::line(format_args!("focus {} {waited} after Shift+Tab | {}", if got.ok { "taken" } else { "REFUSED" }, got.detail));
         if got.ok {
             self.prev_focus = got.prev;
             return;
@@ -1716,6 +1735,7 @@ impl Overlay {
         match ctx.input(|i| i.viewport().focused) {
             Some(true) => self.focus_seen = true,
             Some(false) if self.focus_seen => {
+                overlay_log::line(format_args!("closing: the focus left | in front: {}", os::describe_foreground()));
                 self.prev_focus = None;
                 self.set_open(ctx, false);
             }

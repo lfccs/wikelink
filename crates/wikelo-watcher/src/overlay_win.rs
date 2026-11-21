@@ -7,9 +7,12 @@
 //! owner thread / process id, the hung flag and the monitor of other top-level windows (to find the game's
 //! window by its title), and `SetForegroundWindow` on the window that had the focus before
 //! (to hand it back). No handle to another process is ever opened; nothing here reads, hooks
-//! or injects into another process, and no input is synthesized: that is also why the overlay
-//! never uses egui's `ViewportCommand::Focus`, which on Windows makes winit send a fake Alt
-//! press to get around the foreground rules, and that press would land in the game.
+//! or injects into another process. No key press or mouse movement is ever synthesized: that
+//! is also why the overlay never uses egui's `ViewportCommand::Focus`, which on Windows makes
+//! winit send a fake Alt press to get around the foreground rules, and that press would land
+//! in the game. The one input event this process sends is an empty one (a mouse event with
+//! no movement and no button), and only when Windows refused to bring the overlay to the
+//! front on Shift+Tab (see [`take_focus`]).
 //!
 //! Elsewhere every call is a no-op that answers "unknown".
 
@@ -35,13 +38,16 @@ pub struct PrevFocus {
 }
 
 /// What [`take_focus`] did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(not(windows), allow(dead_code))]
 pub struct FocusTaken {
     /// The overlay is the foreground window now.
     pub ok: bool,
     /// The window to hand the focus back to on close (when `ok`).
     pub prev: Option<PrevFocus>,
+    /// What the window manager answered, for `overlay.log`: the call's result and error
+    /// code, the window in front before and after, and this process's own window.
+    pub detail: String,
 }
 
 /// The exact title of the game's window.
@@ -104,11 +110,15 @@ pub use other::*;
 
 #[cfg(windows)]
 mod win {
-    use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM, POINT, RECT};
+    use windows_sys::Win32::Foundation::{BOOL, CloseHandle, GetLastError, HANDLE, HWND, LPARAM, POINT, RECT, SetLastError};
     use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint, MonitorFromWindow};
+    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
+    use windows_sys::Win32::System::SystemInformation::GetTickCount;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, INPUT, INPUT_MOUSE, LASTINPUTINFO, SendInput};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GWL_EXSTYLE, GetForegroundWindow, GetWindowLongW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsHungAppWindow, IsWindow, IsWindowVisible, LWA_ALPHA,
-        SetForegroundWindow, SetLayeredWindowAttributes, SetWindowPos, WS_EX_LAYERED,
+        EnumWindows, GWL_EXSTYLE, GetClassNameW, GetForegroundWindow, GetWindowLongW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsHungAppWindow, IsIconic, IsWindow,
+        IsWindowVisible, LWA_ALPHA, SetForegroundWindow, SetLayeredWindowAttributes, SetWindowPos, WS_EX_LAYERED,
     };
 
     use super::{FocusTaken, Followed, GAME_TITLE, GameState, Monitor, PrevFocus, Window};
@@ -326,23 +336,128 @@ mod win {
 
     /// Bring the overlay to the foreground (it opened) and say whether it got there, with the
     /// window that had the focus, to hand it back on close. Windows lets a background process
-    /// do this only in some cases (it got the last input, e.g. the WM_HOTKEY). A refusal is
-    /// final: the caller stays closed and says so. Nothing is done to the other window's
+    /// do this only in some cases (it got the last input, e.g. the WM_HOTKEY). After a refusal
+    /// one empty input event is sent ([`empty_input`]) and the request made once more; a
+    /// second refusal is final: the caller stays closed and says so. Nothing is done to the other window's
     /// thread to force the switch (no AttachThreadInput: the game runs under an anti-cheat).
     /// Without its own window (`None`) nothing is tried and the answer is "not in front".
     pub fn take_focus(w: Option<Window>) -> FocusTaken {
-        let Some(w) = w else { return FocusTaken { ok: false, prev: None } };
+        let Some(w) = w else { return FocusTaken { ok: false, prev: None, detail: "own window not found".into() } };
         // SAFETY: no arguments.
         let before = unsafe { GetForegroundWindow() };
         let prev = (before != 0 && before != w.0 && !is_own(before)).then(|| {
             let (thread, pid) = owner(before);
             PrevFocus { window: Window(before), thread, pid }
         });
+        // Described before the call: what the window manager saw when it decided.
+        let (front, own, idle) = (describe(before), describe_own(w), idle_ms());
+        // SAFETY: plain integer; clears this thread's error code so the one read below is the call's.
+        unsafe { SetLastError(0) };
         // SAFETY: this process's own window.
-        if unsafe { SetForegroundWindow(w.0) } != 0 && is_foreground(w) {
-            return FocusTaken { ok: true, prev };
+        let answer = unsafe { SetForegroundWindow(w.0) };
+        // SAFETY: no arguments; this thread's error code.
+        let err = unsafe { GetLastError() };
+        let mut ok = is_foreground(w);
+        // Refused: the player's key went to the window in front, so this process did not get
+        // the last input. One empty input event of its own makes it the last one, and the
+        // same request is made once more.
+        let mut second = String::new();
+        if !ok {
+            let sent = empty_input();
+            // SAFETY: as above.
+            unsafe { SetLastError(0) };
+            // SAFETY: this process's own window.
+            let answer = unsafe { SetForegroundWindow(w.0) };
+            // SAFETY: no arguments; this thread's error code.
+            let err = unsafe { GetLastError() };
+            ok = is_foreground(w);
+            second = format!(" | after an empty input (sent={sent}): SetForegroundWindow={answer} error={err}");
         }
-        FocusTaken { ok: is_foreground(w), prev }
+        // SAFETY: no arguments.
+        let after = unsafe { GetForegroundWindow() };
+        let idle = idle.map_or("?".to_string(), |ms| format!("{ms}ms"));
+        let detail = format!("SetForegroundWindow={answer} error={err} last-input={idle} ago{second} | in front before: {front} | after: {} | own: {own}", describe(after));
+        FocusTaken { ok, prev, detail }
+    }
+
+    /// One empty input event from this process: a mouse event with no movement, no button
+    /// and no wheel. It moves and presses nothing; it only makes this process the one the
+    /// last input came from, which is what Windows asks of a background process before it
+    /// may bring its own window to the front. Says whether the system took the event.
+    fn empty_input() -> bool {
+        // SAFETY: INPUT is plain data and all zeroes is a valid value of it: type 0 is
+        // INPUT_MOUSE, with zero movement and no flags.
+        let input: INPUT = unsafe { std::mem::zeroed() };
+        debug_assert_eq!(input.r#type, INPUT_MOUSE);
+        // SAFETY: one valid INPUT, with its count and size.
+        unsafe { SendInput(1, &input, std::mem::size_of::<INPUT>() as i32) == 1 }
+    }
+
+    /// A window for `overlay.log`: handle, owner process and thread, class and the first
+    /// characters of the title, with a mark when it is the game's or this process's own.
+    /// Window-manager queries only; nothing is sent to the window.
+    fn describe(hwnd: HWND) -> String {
+        if hwnd == 0 {
+            return "none".into();
+        }
+        let (thread, pid) = owner(hwnd);
+        if pid == std::process::id() {
+            return format!("{hwnd:#x} (this overlay)");
+        }
+        let mut class = [0u16; 64];
+        // SAFETY: `class` is a writable buffer of `class.len()` u16; the call writes at most that
+        // many and returns how many characters it copied (0 for a stale handle).
+        let n = unsafe { GetClassNameW(hwnd, class.as_mut_ptr(), class.len() as i32) };
+        let class = String::from_utf16_lossy(&class[..usize::try_from(n).unwrap_or(0).min(class.len())]);
+        let title = short_title(hwnd);
+        let game = if title.trim() == GAME_TITLE { " (the game)" } else { "" };
+        format!("{hwnd:#x} pid={pid} thread={thread} class={class:?} title={title:?}{game}")
+    }
+
+    /// This process's own window for `overlay.log`: its extended style (click-through,
+    /// no-activate and layered are bits of it), and whether it is visible and minimized.
+    fn describe_own(w: Window) -> String {
+        // SAFETY: this process's own window; plain queries.
+        let (ex, visible, iconic) = unsafe { (GetWindowLongW(w.0, GWL_EXSTYLE) as u32, IsWindowVisible(w.0) != 0, IsIconic(w.0) != 0) };
+        format!("{:#x} exstyle={ex:#010x} visible={visible} minimized={iconic} rect={:?}", w.0, window_rect(w))
+    }
+
+    /// The window in front right now, for `overlay.log`.
+    pub fn describe_foreground() -> String {
+        // SAFETY: no arguments.
+        describe(unsafe { GetForegroundWindow() })
+    }
+
+    /// A window, for `overlay.log`.
+    pub fn describe_window(w: Option<Window>) -> String {
+        w.map_or("none".into(), |w| describe(w.0))
+    }
+
+    /// How long ago the system last saw any input (keyboard or mouse), in milliseconds.
+    fn idle_ms() -> Option<u32> {
+        let mut info = LASTINPUTINFO { cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32, dwTime: 0 };
+        // SAFETY: `info` is a valid, writable LASTINPUTINFO with its size set.
+        if unsafe { GetLastInputInfo(&mut info) } == 0 {
+            return None;
+        }
+        // SAFETY: no arguments. Both are the same wrapping millisecond counter.
+        Some(unsafe { GetTickCount() }.wrapping_sub(info.dwTime))
+    }
+
+    /// Whether this process runs elevated ("as administrator"), read from its own token.
+    pub fn elevated() -> Option<bool> {
+        let mut token: HANDLE = 0;
+        // SAFETY: this process's own pseudo-handle; `token` is a valid, writable HANDLE.
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+            return None;
+        }
+        let mut info = TOKEN_ELEVATION { TokenIsElevated: 0 };
+        let mut len = 0u32;
+        // SAFETY: `info` is a writable TOKEN_ELEVATION of the size passed; `len` a writable u32.
+        let ok = unsafe { GetTokenInformation(token, TokenElevation, &mut info as *mut TOKEN_ELEVATION as *mut _, std::mem::size_of::<TOKEN_ELEVATION>() as u32, &mut len) };
+        // SAFETY: the token handle opened above, closed once.
+        unsafe { CloseHandle(token) };
+        (ok != 0).then_some(info.TokenIsElevated != 0)
     }
 
     /// Give the focus back to the window that had it before the overlay opened, if that is
@@ -412,7 +527,19 @@ mod other {
 
     /// The platform moves the focus itself here: take it as done.
     pub fn take_focus(_w: Option<Window>) -> FocusTaken {
-        FocusTaken { ok: true, prev: None }
+        FocusTaken { ok: true, prev: None, detail: String::new() }
+    }
+
+    pub fn describe_foreground() -> String {
+        String::new()
+    }
+
+    pub fn describe_window(_w: Option<Window>) -> String {
+        String::new()
+    }
+
+    pub fn elevated() -> Option<bool> {
+        None
     }
 
     pub fn give_focus(_prev: PrevFocus) {}
