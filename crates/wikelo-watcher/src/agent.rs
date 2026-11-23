@@ -1989,11 +1989,18 @@ fn data_check(client: &Client, name: &str, handle: &str) -> String {
 
 // ----- blueprints in old logs ---------------------------------------------------------
 
-/// How often the channel's `logbackups\` is looked at for old logs not read yet (the first
-/// pass runs when the watcher starts).
+/// The channel whose blueprints count: the test channels are separate environments, where a
+/// blueprint received says nothing about the live one, so their old logs are not read.
+const BACKLOG_CHANNEL: &str = "LIVE";
+/// How often the `logbackups\` folders are looked at for old logs not read yet (the first
+/// check runs when the watcher starts).
 const BACKLOG_EVERY: Duration = Duration::from_secs(3600);
-/// Most old logs read in one pass, the newest first; the others wait for the next pass.
+/// Most old logs read in one pass over one folder, the newest first; the others wait for the
+/// next pass, [`BACKLOG_PAUSE`] later.
 const BACKLOG_FILES_PER_PASS: usize = 200;
+/// The pause between two passes of one check while old logs are still waiting, so a first
+/// run over a thousand files is spread out instead of read in one go.
+const BACKLOG_PAUSE: Duration = Duration::from_secs(5);
 /// Most events in one request of a pass.
 const BACKLOG_BATCH: usize = 200;
 
@@ -2003,8 +2010,10 @@ fn backlog_state_path() -> PathBuf {
 }
 
 /// The old logs already read: their blueprints were accepted, or got a final refusal (see
-/// [`backlog_pass`]). Per channel, file name → its size when read. A file whose size changed is read again. It belongs to one account:
-/// signed in as another one, every file is read again for that one.
+/// [`backlog_pass`]). Per folder (under the key [`backlog_folders`] gives it: the channel for
+/// the followed installation's), file name → its size when read. A file whose size changed
+/// is read again. It belongs to one account: signed in as another one, every file is read
+/// again for that one.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct BacklogState {
     #[serde(default)]
@@ -2223,21 +2232,87 @@ fn backlog_verdict(answer: Result<Ack, (Option<u16>, SendError)>) -> Result<(), 
     }
 }
 
-/// [`backlog_pass`] over the followed channel's `logbackups\`, sending through `client` with
-/// the same request as the live events (see [`backlog_verdict`] for what an answer means).
-fn backlog_check(client: &Client, channel: &str, host: &str, share: bool, account: &str, dir: &Path, stop: &AtomicBool) {
+/// The `logbackups\` folders a check reads, each with the key its files are listed under in
+/// [`BacklogState`]: the followed installation's first, under its channel (the key it always
+/// had), then the folder of every other installation found (`others`: channel and folder),
+/// under `channel|folder` in lower case. Two installations of one channel (the same channel
+/// on two drives) are two folders with two keys; the same folder is listed once.
+fn backlog_folders(channel: &str, followed: &Path, others: &[(String, PathBuf)]) -> Vec<(String, PathBuf)> {
+    let same = |a: &Path, b: &Path| a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase();
+    let mut out = vec![(channel.to_string(), followed.to_path_buf())];
+    for (ch, dir) in others {
+        if out.iter().any(|(_, d)| same(d, dir)) {
+            continue;
+        }
+        out.push((format!("{ch}|{}", dir.to_string_lossy().to_lowercase()), dir.clone()));
+    }
+    out
+}
+
+/// The sum of the passes of one round over every folder.
+fn backlog_sum(passes: &[BacklogPass]) -> BacklogPass {
+    let mut sum = BacklogPass::default();
+    for p in passes {
+        sum.read += p.read;
+        sum.blueprints += p.blueprints;
+        sum.refused += p.refused;
+        sum.failed += p.failed;
+        sum.left += p.left;
+    }
+    sum
+}
+
+/// Whether a check goes on with one more round after `round`: files are still waiting, the
+/// round took some of them, and nothing failed (a failure waits for the next hourly check).
+fn backlog_goes_on(round: &BacklogPass) -> bool {
+    round.left > 0 && round.failed == 0 && round.read + round.refused > 0
+}
+
+/// One check of the old logs: [`backlog_pass`] over each of `folders` (see
+/// [`backlog_folders`]), round after round with [`BACKLOG_PAUSE`] between two while files are
+/// still waiting ([`backlog_goes_on`]). Everything goes out through `client` with the same
+/// request as the live events, under the followed `channel` (see [`backlog_verdict`] for what
+/// an answer means).
+fn backlog_check(client: &Client, channel: &str, host: &str, share: bool, account: &str, folders: &[(String, PathBuf)], stop: &AtomicBool) {
     let parser = wikelo_log::LineParser::new();
     let mut send = |chunk: &[(bool, TrackerOutput)]| backlog_verdict(client.send_with_status(channel, host, share, chunk));
-    let pass = backlog_pass(&backlog_state_path(), account, channel, dir, &parser, stop, &mut send);
-    let BacklogPass { read, blueprints, refused, failed, left } = pass;
-    if read > 0 || refused > 0 || left > 0 || failed > 0 {
-        say!(
-            "{}",
-            trf!(
-                "old logs: {read} read, {blueprints} blueprints sent, {refused} refused, {failed} failed, {left} for later",
-                "logs antigos: {read} lidos, {blueprints} blueprints enviados, {refused} recusados, {failed} com falha, {left} para depois"
-            )
-        );
+    loop {
+        let mut passes = Vec::with_capacity(folders.len());
+        for (key, dir) in folders {
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+            let pass = backlog_pass(&backlog_state_path(), account, key, dir, &parser, stop, &mut send);
+            // The server is out of reach: the other folders would fail the same way.
+            let failed = pass.failed > 0;
+            passes.push(pass);
+            if failed {
+                break;
+            }
+        }
+        let round = backlog_sum(&passes);
+        let BacklogPass { read, blueprints, refused, failed, left } = round;
+        if read > 0 || refused > 0 || left > 0 || failed > 0 {
+            let n = folders.len();
+            say!(
+                "{}",
+                trf!(
+                    "old logs ({n} folders): {read} read, {blueprints} blueprints sent, {refused} refused, {failed} failed, {left} still to read",
+                    "logs antigos ({n} pastas): {read} lidos, {blueprints} blueprints enviados, {refused} recusados, {failed} com falha, {left} ainda por ler"
+                )
+            );
+        }
+        if !backlog_goes_on(&round) {
+            return;
+        }
+        // In short steps, so quitting never waits for the pause.
+        let until = Instant::now() + BACKLOG_PAUSE;
+        while Instant::now() < until {
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
     }
 }
 
@@ -2454,16 +2529,25 @@ pub fn run(opts: WatchOptions) -> anyhow::Result<()> {
             dirty = true;
         }
 
-        // Blueprints in the old logs of `logbackups\`: right after start, then hourly. In a
-        // thread of its own, so reading many files never holds up the live tailing.
-        if last_backlog.is_none_or(|t| t.elapsed() > BACKLOG_EVERY) && !backlog_busy.swap(true, Ordering::Relaxed) {
+        // Blueprints in the old logs of `logbackups\`, of this installation and of every other
+        // LIVE one found on this PC: right after start, then hourly, and only while the
+        // followed channel is LIVE (see `BACKLOG_CHANNEL`). In a thread of its own, so reading
+        // many files never holds up the live tailing.
+        if channel.eq_ignore_ascii_case(BACKLOG_CHANNEL) && last_backlog.is_none_or(|t| t.elapsed() > BACKLOG_EVERY) && !backlog_busy.swap(true, Ordering::Relaxed) {
             last_backlog = Some(Instant::now());
             let c = client.clone();
             let (ch, h, account, dir) = (channel.clone(), host.clone(), cfg.handle.clone(), install.logbackups_dir.clone());
             let (busy, halt) = (backlog_busy.clone(), stop_loop.clone());
             std::thread::spawn(move || {
                 // A panic in there must not leave the pass marked as running forever.
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| backlog_check(&c, &ch, &h, share, &account, &dir, &halt)));
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let others: Vec<(String, PathBuf)> = wikelo_install::discover_installs(&[])
+                        .into_iter()
+                        .filter(|i| i.channel.eq_ignore_ascii_case(BACKLOG_CHANNEL) && i.logbackups_dir.is_dir())
+                        .map(|i| (i.channel, i.logbackups_dir))
+                        .collect();
+                    backlog_check(&c, &ch, &h, share, &account, &backlog_folders(&ch, &dir, &others), &halt)
+                }));
                 busy.store(false, Ordering::Relaxed);
             });
         }
@@ -4360,6 +4444,32 @@ mod tests {
         let pass = pass_with(&tmp.path().join("logbackups-read.json"), &game, "TestPilot", true, &mut sent);
         assert_eq!(pass.blueprints, 3);
         assert_eq!(sent_names(&sent), vec!["Twice", "Other", "Twice"]);
+    }
+
+    #[test]
+    fn every_installation_has_its_own_list_of_old_logs() {
+        let live = PathBuf::from(r"C:\Games\StarCitizen\LIVE\logbackups");
+        let ptu_c = PathBuf::from(r"C:\Games\StarCitizen\PTU\logbackups");
+        let ptu_g = PathBuf::from(r"G:\Games\StarCitizen\PTU\logbackups");
+        let others = vec![("LIVE".to_string(), PathBuf::from(r"c:\games\starcitizen\live\LOGBACKUPS")), ("PTU".to_string(), ptu_c.clone()), ("PTU".to_string(), ptu_g.clone()), ("PTU".to_string(), ptu_g.clone())];
+        let folders = backlog_folders("LIVE", &live, &others);
+        // The followed one first, under the key it always had; itself (whatever the case) and a repeat listed once.
+        assert_eq!(folders.iter().map(|(_, d)| d.clone()).collect::<Vec<_>>(), vec![live.clone(), ptu_c, ptu_g]);
+        assert_eq!(folders[0].0, "LIVE");
+        assert_eq!(folders[1].0, r"PTU|c:\games\starcitizen\ptu\logbackups");
+        assert_ne!(folders[1].0, folders[2].0, "the same channel on two drives: two lists");
+        assert_eq!(backlog_folders("LIVE", &live, &[]), vec![("LIVE".to_string(), live)]);
+    }
+
+    #[test]
+    fn a_check_of_old_logs_goes_on_while_files_wait_and_nothing_failed() {
+        let pass = |read, refused, failed, left| BacklogPass { read, blueprints: 0, refused, failed, left };
+        assert_eq!(backlog_sum(&[pass(200, 1, 0, 853), pass(8, 0, 0, 0), BacklogPass { read: 1, blueprints: 7, refused: 0, failed: 1, left: 2 }]), BacklogPass { read: 209, blueprints: 7, refused: 1, failed: 1, left: 855 });
+        assert!(backlog_goes_on(&pass(200, 0, 0, 853)));
+        assert!(backlog_goes_on(&pass(0, 3, 0, 5)), "set aside counts as taken");
+        assert!(!backlog_goes_on(&pass(200, 0, 0, 0)), "nothing left");
+        assert!(!backlog_goes_on(&pass(200, 0, 1, 853)), "a failure waits for the next hourly check");
+        assert!(!backlog_goes_on(&pass(0, 0, 0, 853)), "a round that took nothing never loops");
     }
 
     #[test]

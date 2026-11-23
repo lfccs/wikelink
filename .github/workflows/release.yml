@@ -6,7 +6,8 @@
 #
 # To release: bump `version` in Cargo.toml, commit, then create a tag `vX.Y.Z` (GitHub →
 # Releases → "Draft a new release" with a new tag also works); the workflow attaches the exe,
-# SHA256SUMS.txt and the attestation to that release.
+# SHA256SUMS.txt and the attestation to that release. The release text is that version's
+# section of CHANGELOG.md (English only), so the section has to exist before tagging.
 name: release
 
 on:
@@ -32,6 +33,27 @@ jobs:
           $v = (cargo pkgid -p wikelo-watcher) -replace '.*[#@]', ''
           if ("v$v" -ne $env:GITHUB_REF_NAME) { Write-Error "tag $env:GITHUB_REF_NAME, but Cargo.toml says $v"; exit 1 }
           "version $v"
+      - name: Release notes (this version's section of CHANGELOG.md, then how to check the download)
+        shell: pwsh
+        run: |
+          $v = $env:GITHUB_REF_NAME -replace '^v', ''
+          $out = @(); $in = $false
+          foreach ($l in Get-Content CHANGELOG.md -Encoding utf8) {
+            if ($l -match '^## ') { $in = ($l.Trim() -eq "## $v"); continue }
+            if ($in) { $out += $l }
+          }
+          $notes = ($out -join "`n").Trim()
+          if (-not $notes) { Write-Error "CHANGELOG.md has no section for $v"; exit 1 }
+          $check = @(
+            '`wikelink.exe` (Wikelink), built by GitHub Actions from this commit.',
+            'Check the download: `Get-FileHash wikelink.exe -Algorithm SHA256` must match `SHA256SUMS.txt`,',
+            'and `gh attestation verify .\wikelink.exe --repo lfccs/wikelink` confirms this repository built it.',
+            '`wikelink hash` shows the embedded commit and the hash of the extracted data; `wikelink status` shows the version.',
+            'Upgrading from `wikelo-watcher.exe`: open `wikelink.exe` once; it takes over the sign-in, the settings and "start with Windows". The old file can then be deleted.'
+          ) -join "`n"
+          New-Item -ItemType Directory -Force dist | Out-Null
+          "## What changed`n`n$notes`n`n---`n`n$check" | Set-Content -Encoding utf8 dist\notes.md
+          Get-Content dist\notes.md
       - name: Build
         run: cargo build --release --locked -p wikelo-watcher --bin wikelink
       - name: Checksums
@@ -52,14 +74,4 @@ jobs:
           files: |
             dist/wikelink.exe
             dist/SHA256SUMS.txt
-          body: |
-            `wikelink.exe` (Wikelink), built by GitHub Actions from this commit.
-            Check the download: `Get-FileHash wikelink.exe -Algorithm SHA256` must match `SHA256SUMS.txt`,
-            and `gh attestation verify .\wikelink.exe --repo lfccs/wikelink` confirms this repository built it.
-            `wikelink hash` shows the embedded commit and the hash of the extracted data; `wikelink status` shows the version.
-            Upgrading from `wikelo-watcher.exe`: open `wikelink.exe` once; it takes over the sign-in, the settings and "start with Windows". The old file can then be deleted.
-
-            `wikelink.exe` (Wikelink), compilado pelo GitHub Actions a partir deste commit.
-            Confira o arquivo baixado: `Get-FileHash wikelink.exe -Algorithm SHA256` deve bater com `SHA256SUMS.txt`,
-            e `gh attestation verify .\wikelink.exe --repo lfccs/wikelink` confirma que foi este repositório que o compilou.
-            Vindo do `wikelo-watcher.exe`: abra o `wikelink.exe` uma vez; ele assume a conta, as opções e o "iniciar com o Windows". Depois o arquivo antigo pode ser apagado.
+          body_path: dist/notes.md
