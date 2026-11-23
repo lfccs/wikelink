@@ -2,17 +2,21 @@
 //! the changes the player made. No window and no network here: everything is testable with
 //! made-up times.
 //!
-//! One request at a time, chosen by [`Engine::next_job_all`]: a change first (the clicks on
-//! one item's `-` / `+` summed into one write once they stop for [`COALESCE`]), then the read
-//! that settles the changes made, the search index, the player's inventory (the quantities and
+//! One request at a time, chosen by [`Engine::next_job_with_mission`]: a change first (the
+//! clicks on one item's `-` / `+` summed into one write once they stop for [`COALESCE`]), then
+//! the read that settles the changes made, the search index, the detail of the blueprint whose
+//! screen was just opened, the blueprints of the mission whose screen was just opened, the
+//! player's inventory (the quantities and
 //! places of the search's item rows, the stacks a move between places goes by), the channel's
 //! locations (the move picker's filter), a search (older servers only), and the regular read
 //! every [`POLL_EVERY`] (none while changes wait to go out). A write may take several requests
 //! (a move, one per quality): see [`classify_part`]. Every request counts against one
 //! budget per minute ([`BUDGET_ALL`], reads and searches only up to [`BUDGET_READS`], so
 //! writes always have room), and a 429 stops everything for the wait it was told to take;
-//! the index and the inventory have budgets and 429 waits of their own ([`BUDGET_INDEX`],
-//! [`BUDGET_INVENTORY`]).
+//! the index, the inventory and a blueprint's detail or a mission's blueprints (asked for when
+//! the player opens a screen of the blueprints card; the two share one budget and one 429
+//! wait) have budgets and 429 waits of their own ([`BUDGET_INDEX`], [`BUDGET_INVENTORY`],
+//! [`BUDGET_DETAIL`]), so opening screens quickly never starves the regular read.
 //!
 //! A change shows at once and stays drawn until a read sent after its write came back (then
 //! the server's answer has it). A write the server refused (an HTTP error) is dropped, so the
@@ -52,7 +56,13 @@ pub const BUDGET_INDEX: usize = 11;
 /// The whole inventory (`GET /api/inventory`, the route the site uses): read when the
 /// overlay opens, every 30 s while it is open and after a write settles; this caps it.
 pub const BUDGET_INVENTORY: usize = 8;
-/// A 429 on the index or the inventory without a `Retry-After`: that kind waits this long.
+/// A blueprint's detail (`GET .../overlay/blueprint/{blueprint}`) and a mission's blueprints
+/// (`GET .../overlay/mission/{contract}/blueprints`), one per screen opened, together. The
+/// server counts them with the overlay's reads, whose share here is [`BUDGET_READS`]: the two
+/// together stay under the server's limit (30 a minute).
+pub const BUDGET_DETAIL: usize = 6;
+/// A 429 on the index, the inventory or a detail (or a mission's blueprints) without a
+/// `Retry-After`: that kind waits this long.
 const AUX_LIMIT_WAIT: Duration = Duration::from_secs(10);
 /// Largest sum of clicks one write carries, either way.
 pub const MAX_DELTA: i64 = 100_000;
@@ -279,6 +289,10 @@ pub enum Job {
     Inventory(u64),
     /// The channel's locations, for the move picker's filter.
     Locations,
+    /// The detail of the blueprint with this key (a screen of the blueprints card was opened).
+    Detail(String),
+    /// The blueprints of the mission with this contract id (its screen was opened).
+    Mission(String),
 }
 
 /// The request on its way, with the number of the last finished write when it went out
@@ -291,6 +305,8 @@ enum Flight {
     Index,
     Inventory(u64),
     Locations,
+    Detail,
+    Mission,
 }
 
 /// What a write's answer means for the player.
@@ -323,9 +339,13 @@ pub struct Engine {
     budget: Budget,
     index_budget: Budget,
     inventory_budget: Budget,
-    /// After a 429 on the index or the inventory, that kind (only) waits until then.
+    /// Shared by the details and the missions' blueprints.
+    detail_budget: Budget,
+    /// After a 429 on the index, the inventory or a detail (or a mission's blueprints: the
+    /// same wait), that kind (only) waits until then.
     index_blocked_until: Option<Instant>,
     inventory_blocked_until: Option<Instant>,
+    detail_blocked_until: Option<Instant>,
 }
 
 /// The end of the wait a 429 on the index or the inventory asks for.
@@ -355,8 +375,10 @@ impl Engine {
             budget: Budget::default(),
             index_budget: Budget::default(),
             inventory_budget: Budget::default(),
+            detail_budget: Budget::default(),
             index_blocked_until: None,
             inventory_blocked_until: None,
+            detail_blocked_until: None,
         }
     }
 
@@ -387,16 +409,48 @@ impl Engine {
         self.next_job_all(now, || false, || None, || false, search)
     }
 
-    /// [`next_job`](Self::next_job), with the search index (`index`: one is wanted now) and
-    /// the inventory (`inventory`: its number, once it is due), each within a budget of its
-    /// own, then the channel's locations (`locations`: wanted now; within the reads' budget),
-    /// in that order. They go before a search on an older server and the regular read, never
-    /// before a write or the read that settles it. Each closure is asked only when its
-    /// request may go out now.
+    /// [`next_job_with_detail`](Self::next_job_with_detail) without a blueprint's detail.
+    #[cfg(test)]
     pub fn next_job_all(
         &mut self,
         now: Instant,
         index: impl FnOnce() -> bool,
+        inventory: impl FnOnce() -> Option<u64>,
+        locations: impl FnOnce() -> bool,
+        search: impl FnOnce() -> Option<(u64, String)>,
+    ) -> Option<Job> {
+        self.next_job_with_detail(now, index, || None, inventory, locations, search)
+    }
+
+    /// [`next_job_with_mission`](Self::next_job_with_mission) without a mission's blueprints.
+    #[cfg(test)]
+    pub fn next_job_with_detail(
+        &mut self,
+        now: Instant,
+        index: impl FnOnce() -> bool,
+        detail: impl FnOnce() -> Option<String>,
+        inventory: impl FnOnce() -> Option<u64>,
+        locations: impl FnOnce() -> bool,
+        search: impl FnOnce() -> Option<(u64, String)>,
+    ) -> Option<Job> {
+        self.next_job_with_mission(now, index, detail, || None, inventory, locations, search)
+    }
+
+    /// [`next_job`](Self::next_job), with the search index (`index`: one is wanted now), a
+    /// blueprint's detail (`detail`: the key of the screen just opened), a mission's blueprints
+    /// (`mission`: the contract of the screen just opened; within the details' budget) and the
+    /// inventory (`inventory`: its number, once it is due), each within a budget of its own,
+    /// then the channel's locations (`locations`: wanted now; within the reads' budget), in
+    /// that order. They go before a search on an older server and the regular read, never
+    /// before a write or the read that settles it. Each closure is asked only when its request
+    /// may go out now.
+    #[allow(clippy::too_many_arguments)]
+    pub fn next_job_with_mission(
+        &mut self,
+        now: Instant,
+        index: impl FnOnce() -> bool,
+        detail: impl FnOnce() -> Option<String>,
+        mission: impl FnOnce() -> Option<String>,
         inventory: impl FnOnce() -> Option<u64>,
         locations: impl FnOnce() -> bool,
         search: impl FnOnce() -> Option<(u64, String)>,
@@ -424,6 +478,17 @@ impl Engine {
             self.index_budget.record(now);
             self.flight = Some(Flight::Index);
             return Some(Job::Index);
+        }
+        let details_free = self.detail_blocked_until.is_none_or(|t| now >= t) && self.detail_budget.allows_cap(now, BUDGET_DETAIL);
+        if details_free && let Some(key) = detail() {
+            self.detail_budget.record(now);
+            self.flight = Some(Flight::Detail);
+            return Some(Job::Detail(key));
+        }
+        if details_free && let Some(contract) = mission() {
+            self.detail_budget.record(now);
+            self.flight = Some(Flight::Mission);
+            return Some(Job::Mission(contract));
         }
         if self.inventory_blocked_until.is_none_or(|t| now >= t)
             && self.inventory_budget.allows_cap(now, BUDGET_INVENTORY)
@@ -588,6 +653,36 @@ impl Engine {
         }
     }
 
+    /// A blueprint's detail came back (`limit`: it was a 429, which holds back only the
+    /// details).
+    pub fn on_detail(&mut self, limit: Option<Limit>, now: Instant) {
+        if matches!(self.flight, Some(Flight::Detail)) {
+            self.flight = None;
+        }
+        if let Some(t) = aux_block(limit, now) {
+            self.detail_blocked_until = Some(t);
+        }
+    }
+
+    /// A mission's blueprints came back (`limit`: it was a 429, which holds back the details
+    /// and the missions' blueprints only).
+    pub fn on_mission(&mut self, limit: Option<Limit>, now: Instant) {
+        if matches!(self.flight, Some(Flight::Mission)) {
+            self.flight = None;
+        }
+        if let Some(t) = aux_block(limit, now) {
+            self.detail_blocked_until = Some(t);
+        }
+    }
+
+    /// How long until a detail or a mission's blueprints may go out (their budget, a 429 on
+    /// them or on everything); zero: now.
+    pub fn detail_ready_in(&self, now: Instant) -> Duration {
+        let blocked = self.detail_blocked_until.into_iter().chain(self.blocked_until).max().unwrap_or(now);
+        let at = self.detail_budget.free_at_cap(now, BUDGET_DETAIL).max(blocked);
+        at.saturating_duration_since(now)
+    }
+
     /// The inventory came back (`limit`: it was a 429, which holds back only the inventory).
     /// Returns the number of the last write finished before it went out: it includes that one
     /// and every earlier one.
@@ -643,8 +738,10 @@ impl Engine {
         self.budget = Budget::default();
         self.index_budget = Budget::default();
         self.inventory_budget = Budget::default();
+        self.detail_budget = Budget::default();
         self.index_blocked_until = None;
         self.inventory_blocked_until = None;
+        self.detail_blocked_until = None;
     }
 
     /// Signed out, or a server without the overlay: the changes are dropped.
@@ -1024,6 +1121,98 @@ mod tests {
         // A pin from the search is busy, not leaving.
         e.click(Local::PinItem { item_id: "p".into(), name: "P".into(), have: 0.0 }, t0);
         assert!(e.pin_busy("p") && !e.unpinning("p"));
+    }
+
+    fn no_detail() -> Option<String> {
+        None
+    }
+
+    #[test]
+    fn a_detail_goes_after_the_index_and_before_the_inventory_never_before_a_write() {
+        let t0 = Instant::now();
+        let mut e = settled_engine(t0);
+        let bp = || Some("BP_a".to_string());
+        assert_eq!(e.next_job_with_detail(t0, || true, || panic!("the index first"), || None, || false, no_search), Some(Job::Index));
+        e.on_index(None, t0);
+        assert_eq!(e.next_job_with_detail(t0, || false, bp, || panic!("the detail first"), || false, no_search), Some(Job::Detail("BP_a".into())));
+        assert_eq!(e.next_job_with_detail(t0, || false, || panic!("one request at a time"), || None, || false, no_search), None);
+        e.on_detail(None, t0);
+        assert!(e.idle(), "its answer ends the flight");
+        // A write and the read that settles it go first.
+        e.click(Local::UnpinItem { item_id: "a".into() }, t0);
+        assert!(matches!(e.next_job_with_detail(t0, || false, || panic!("a write first"), || None, || false, no_search), Some(Job::Write(1, _))));
+        e.on_write(1, WriteResult::Applied, t0);
+        let t1 = t0 + READ_AFTER_WRITE_GAP;
+        assert_eq!(e.next_job_with_detail(t1, || false, || panic!("the settling read first"), || None, || false, no_search), Some(Job::Read));
+        e.on_read(Outcome::Good, None, t1);
+        assert_eq!(e.next_job_with_detail(t1, || false, bp, || None, || false, no_search), Some(Job::Detail("BP_a".into())));
+        e.on_detail(None, t1);
+        assert_eq!(e.next_job_with_detail(t1, || false, no_detail, || None, || false, no_search), None, "nothing wanted: the regular read keeps its time");
+    }
+
+    #[test]
+    fn opening_rows_quickly_cannot_starve_the_regular_read() {
+        let t0 = Instant::now();
+        let mut e = settled_engine(t0);
+        for i in 0..BUDGET_DETAIL as u64 {
+            let at = t0 + ms(i);
+            assert_eq!(e.next_job_with_detail(at, || false, || Some(format!("BP_{i}")), || None, || false, no_search), Some(Job::Detail(format!("BP_{i}"))));
+            e.on_detail(None, at);
+        }
+        let t1 = t0 + ms(100);
+        assert_eq!(e.next_job_with_detail(t1, || false, || panic!("no room"), || None, || false, no_search), None, "its share is spent");
+        assert_eq!(e.detail_ready_in(t1), BUDGET_WINDOW - ms(100));
+        let t2 = t0 + POLL_EVERY;
+        assert_eq!(e.next_job_with_detail(t2, || false, || panic!("no room"), || None, || false, no_search), Some(Job::Read), "the regular read still has its own");
+        e.on_read(Outcome::Good, None, t2);
+        assert_eq!(e.next_job_with_detail(t0 + BUDGET_WINDOW, || false, || Some("BP_x".into()), || None, || false, no_search), Some(Job::Detail("BP_x".into())), "a minute later it fits again");
+        // The server counts the details with the overlay's reads (30 a minute): both shares fit.
+        const { assert!(BUDGET_READS + BUDGET_DETAIL <= 30 && BUDGET_DETAIL >= 3) };
+    }
+
+    #[test]
+    fn a_429_on_a_detail_holds_back_only_the_details() {
+        let t0 = Instant::now();
+        let mut e = settled_engine(t0);
+        assert_eq!(e.next_job_with_detail(t0, || false, || Some("BP_a".into()), || None, || false, no_search), Some(Job::Detail("BP_a".into())));
+        e.on_detail(Some(Limit(None)), t0);
+        assert_eq!(e.detail_ready_in(t0), AUX_LIMIT_WAIT);
+        assert_eq!(e.next_job_with_detail(t0 + ms(10), || false, || panic!("held back"), || Some(1), || false, no_search), Some(Job::Inventory(1)), "the rest still goes");
+        e.on_inventory(None, t0 + ms(10));
+        assert_eq!(e.detail_ready_in(t0 + AUX_LIMIT_WAIT), Duration::ZERO);
+        // A 429 on everything holds it back too; another endpoint forgets every wait.
+        e.on_detail(Some(Limit(Some(Duration::from_secs(30)))), t0);
+        assert_eq!(e.detail_ready_in(t0), Duration::from_secs(30));
+        e.reset(t0);
+        assert_eq!(e.detail_ready_in(t0), Duration::ZERO);
+    }
+
+    #[test]
+    fn a_missions_blueprints_go_after_the_detail_within_its_budget_and_its_429_wait() {
+        let t0 = Instant::now();
+        let mut e = settled_engine(t0);
+        let c1 = || Some("c1".to_string());
+        // After a detail wanted at the same time, before the inventory.
+        assert_eq!(e.next_job_with_mission(t0, || false, || Some("BP_a".into()), || panic!("the detail first"), || None, || false, no_search), Some(Job::Detail("BP_a".into())));
+        e.on_detail(None, t0);
+        assert_eq!(e.next_job_with_mission(t0, || false, no_detail, c1, || panic!("the mission first"), || false, no_search), Some(Job::Mission("c1".into())));
+        assert_eq!(e.next_job_with_mission(t0, || false, no_detail, || panic!("one request at a time"), || None, || false, no_search), None);
+        e.on_mission(None, t0);
+        assert!(e.idle(), "its answer ends the flight");
+        // One budget for both: a detail and missions spend the same share.
+        for i in 1..BUDGET_DETAIL as u64 - 1 {
+            let at = t0 + ms(i);
+            assert_eq!(e.next_job_with_mission(at, || false, no_detail, || Some(format!("c{i}")), || None, || false, no_search), Some(Job::Mission(format!("c{i}"))));
+            e.on_mission(None, at);
+        }
+        let t1 = t0 + ms(100);
+        assert_eq!(e.next_job_with_mission(t1, || false, || panic!("no room"), || panic!("no room"), || None, || false, no_search), None, "the shared share is spent");
+        // A 429 on a mission holds back the details and the missions, not the rest.
+        let t2 = t0 + BUDGET_WINDOW;
+        assert_eq!(e.next_job_with_mission(t2, || false, no_detail, c1, || None, || false, no_search), Some(Job::Mission("c1".into())));
+        e.on_mission(Some(Limit(None)), t2);
+        assert_eq!(e.detail_ready_in(t2), AUX_LIMIT_WAIT);
+        assert_eq!(e.next_job_with_mission(t2 + ms(10), || false, || panic!("held back"), || panic!("held back"), || Some(1), || false, no_search), Some(Job::Inventory(1)), "the rest still goes");
     }
 
     #[test]

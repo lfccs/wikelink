@@ -51,6 +51,17 @@ pub struct WikeloDataset {
     /// before the field existed keep their canonical hash.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub locations: Vec<Location>,
+    /// Every creation blueprint of the build (`CraftingBlueprintRecord` with a
+    /// `CraftingProcess_Creation`), Wikelo or not, sorted by record name. `crafting` keeps only
+    /// the recipes the Wikelo contracts involve. Left out of the JSON when empty, so datasets
+    /// from before the field existed keep their canonical hash.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blueprints: Vec<Blueprint>,
+    /// The quality tiers of every crafting material (`CraftingQualityQuantizationRecord`), sorted
+    /// by key. Left out of the JSON when empty, so datasets from before the field existed keep
+    /// their canonical hash.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quality_tiers: Vec<QualityTiers>,
     /// Which extractor build produced this dataset and from which game files, so two
     /// extractions can be compared (see `validate::canonical_hash`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -79,8 +90,9 @@ pub struct ExtractorInfo {
 /// What generation of data this extractor writes. It goes up by one whenever the extractor
 /// starts writing something it did not write before (a new field, a corrected one), and is
 /// what decides whether a copy made earlier is worth replacing: the program's own version
-/// says nothing about the data. 2: locations.
-pub const EXTRACTOR_REVISION: u32 = 2;
+/// says nothing about the data. 2: locations. 3: every blueprint. 4: what each blueprint's
+/// item is. 5: the quality tiers of each crafting material. 6: the pool chance.
+pub const EXTRACTOR_REVISION: u32 = 6;
 
 /// One item reward of a non-Wikelo mission, with the quantity from the game data.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -605,6 +617,207 @@ pub struct CraftRecipe {
     pub sources: Vec<CraftSource>,
 }
 
+/// One creation blueprint (`CraftingBlueprintRecord`) as the game data describes it: what it
+/// makes, what it costs, what the quality of each ingredient changes, and where to get it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct Blueprint {
+    /// `CraftingBlueprintRecord` GUID.
+    pub id: String,
+    /// Record name without the type prefix: `BP_CRAFT_behr_rifle_ballistic_01`.
+    pub name: String,
+    /// English name of the blueprint itself (`blueprintName`), when the game fills it in; most
+    /// say `@LOC_PLACEHOLDER` and the output item's name is the one to show.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// `BlueprintCategoryRecord` name without the prefix: `FPSWeapons`, `VehicleComponentS2`.
+    pub category: Option<String>,
+    /// The crafted item's id when the item is in `items`; None otherwise.
+    pub output_item_id: Option<String>,
+    pub output_class_name: String,
+    /// English display name of the crafted item (its class name when the game has none).
+    pub output_name: String,
+    /// The crafted item's `SItemDefinition.Type` as the game writes it: `Cooler`,
+    /// `WeaponPersonal`, `Char_Armor_Helmet`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_type: Option<String>,
+    /// The crafted item's `SItemDefinition.SubType` (`Medium`, `Magazine`, `Gun`); None when
+    /// the game says `UNDEFINED` or nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_sub_type: Option<String>,
+    /// The crafted item's `SItemDefinition.Size` (0 to 12).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u32>,
+    /// The crafted item's `SItemDefinition.Grade`: 1 = A, 2 = B, 3 = C, 4 = D.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grade: Option<u32>,
+    /// The crafted item's manufacturer, when it has one with a real name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manufacturer: Option<BlueprintManufacturer>,
+    /// The value of the `Class:` line of the crafted item's English description (`Military`,
+    /// `Industrial`, `Stealth`, `Civilian`, `Competition`), when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_class: Option<String>,
+    /// The folders of the blueprint record's path after `blueprints/crafting/`, in lower case
+    /// and without the file name: `["fpsgear", "weapons", "rifle"]`. At most six.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// Listed in the game's `CraftingGlobalParams.defaultBlueprintSelection`: every player
+    /// has it without earning it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub default: bool,
+    pub craft_time_sec: f64,
+    /// `count` of the mandatory cost when it is a group of slots: how many of `slots` the
+    /// recipe asks for. None when the mandatory cost is a single slot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slots_required: Option<u32>,
+    /// The mandatory cost, one entry per slot.
+    pub slots: Vec<BlueprintSlot>,
+    /// The record's `optionalCosts`, read the same way, kept apart from the mandatory ones.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub optional_slots: Vec<BlueprintSlot>,
+    /// Where the blueprint is granted; empty when no game record that the extractor reads
+    /// grants it.
+    #[serde(default)]
+    pub sources: Vec<BlueprintSource>,
+}
+
+/// The manufacturer of a blueprint's item (`SCItemManufacturer`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct BlueprintManufacturer {
+    /// The record's `Code`: `ACOM`, `BEHR`.
+    pub code: String,
+    /// English name from the record's localization.
+    pub name: String,
+}
+
+/// A slot of a blueprint: supply `count` of `options`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct BlueprintSlot {
+    /// English slot name (`Frame`, `Barrel`), or the record's debug name in title case.
+    pub name: String,
+    pub count: u32,
+    pub options: Vec<CraftInput>,
+    /// `CraftingCostContext_QuantityMultiplier` values as the record writes them. The data
+    /// does not say what the game multiplies by them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quantity_multipliers: Vec<QuantityMultiplier>,
+    /// What the quality of this slot's ingredients changes on the crafted item.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quality_effects: Vec<QualityEffect>,
+}
+
+/// A quantity multiplier attached to a slot or to one of its options.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct QuantityMultiplier {
+    /// Index in the slot's `options`; None when the multiplier sits on the slot itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub option: Option<u32>,
+    pub multiplier: f64,
+}
+
+/// One gameplay property a slot's quality changes, with the quality ranges the record maps.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct QualityEffect {
+    /// Name of the gameplay property record: `gpp_weapon_recoil_kick`.
+    pub key: String,
+    /// English name from the property record, when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// In the record's order (a property may map several quality bands).
+    pub ranges: Vec<QualityRange>,
+}
+
+/// One `CraftingGameplayPropertyModifierValueRange_*` entry, as written: from `start_quality`
+/// to `end_quality` the modifier goes from `at_start` to `at_end`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct QualityRange {
+    pub kind: QualityRangeKind,
+    pub start_quality: i64,
+    pub end_quality: i64,
+    /// `modifierAtStart` (linear) or `additiveModifierAtStart` (integer additive).
+    pub at_start: f64,
+    /// `modifierAtEnd` (linear) or `additiveModifierAtEnd` (integer additive).
+    pub at_end: f64,
+}
+
+/// The type of a [`QualityRange`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum QualityRangeKind {
+    /// `CraftingGameplayPropertyModifierValueRange_Linear`: a multiplier.
+    #[default]
+    Linear,
+    /// `CraftingGameplayPropertyModifierValueRange_LinearIntegerAdditive`: an integer added.
+    IntegerAdditive,
+}
+
+/// One way to obtain a blueprint.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct BlueprintSource {
+    /// `contract`: a contract result (`BlueprintRewards`) draws from a blueprint pool that
+    /// lists the blueprint. The only kind the extractor finds today.
+    pub kind: String,
+    /// Contract definition GUID (`contractDefinitionId` in Game.log), Wikelo's or another giver's.
+    pub contract_id: String,
+    /// The title `contracts` gives a Wikelo contract; for other givers the mission's localized
+    /// title, as `missions` would name it. The debug name when the game has none.
+    pub title: String,
+    /// The faction that offers the contract, when the data says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub giver: Option<String>,
+    /// `accept` (granted when the contract is accepted) or `complete`.
+    pub when: String,
+    /// `BlueprintPoolRecord` name without the prefix: `BP_MISSIONREWARD_FoxwellEnforcement_Patrol`.
+    pub pool: String,
+    /// Between 0 and 1: the result's `chance` times this blueprint's weight in the pool over
+    /// the pool's total weight (entries without a blueprint count in the total, as listed).
+    /// Not the same as [`CraftSource::chance`], which is the raw weight times the chance.
+    pub chance: f64,
+    /// The result's own `chance` (between 0 and 1), only when it is below 1: how often the
+    /// mission gives a blueprint of the pool at all. None: it always gives one, among the
+    /// blueprints of the pool the player has not acquired yet (a pool never gives the same
+    /// blueprint twice, and all of its blueprints are equally likely).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_chance: Option<f64>,
+    /// Not offered in this build: not-for-release or work-in-progress on the generator or the
+    /// contract, like [`MissionInfo::disabled`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disabled: bool,
+}
+
+/// The quality tiers of one crafting material, from its `CraftingQualityQuantizationRecord`
+/// (`Quantization_<Material>`): the game rounds a material's quality (0 to 1000) to the value
+/// of the band it falls in.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct QualityTiers {
+    /// Record name without `CraftingQualityQuantizationRecord.Quantization_`: `Agricium`,
+    /// `JumpingLimes`.
+    pub key: String,
+    /// English name of the material as blueprint slots name it ([`CraftInput::name`]); the key
+    /// with a space between its words (`Jumping Limes`) when no resource could be matched.
+    pub name: String,
+    /// The record's `qualityQuantization.bands`, ascending.
+    pub bands: Vec<QualityBand>,
+}
+
+/// One band of [`QualityTiers`]: a quality from `start` to `end` (both included) counts as
+/// `value` (the record's `mappedValue`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct QualityBand {
+    pub start: i64,
+    pub end: i64,
+    pub value: i64,
+}
+
 /// A mission name without the instance index the game appends to some of them in Game.log
 /// (`GillysPilotSchool_Mission06_0` is the contract `GillysPilotSchool_Mission06`). Names that
 /// do not end in `_<digits>` come back unchanged.
@@ -866,6 +1079,8 @@ mod tests {
             mission_drops: vec![],
             missions: vec![],
             locations: vec![],
+            blueprints: vec![],
+            quality_tiers: vec![],
             crafting: vec![],
             warnings: vec![],
             extractor: None,
@@ -880,6 +1095,76 @@ mod tests {
         ds.locations = vec![Location { id: "Stanton2_Orison".into(), name: "Orison".into(), system: Some("Stanton".into()), kind: "city".into(), home: true, ..Default::default() }];
         let json = serde_json::to_string(&ds).unwrap();
         assert!(json.contains(r#""locations":[{"id":"Stanton2_Orison","name":"Orison","system":"Stanton","kind":"city","home":true}]"#), "{json}");
+        let back: WikeloDataset = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ds);
+    }
+
+    #[test]
+    fn blueprints_roundtrip_json_and_stay_out_when_empty() {
+        let mut ds: WikeloDataset = serde_json::from_value(serde_json::json!({
+            "schemaVersion": 1, "source": "test",
+            "build": {"channel": "LIVE", "branch": "b", "version": "4.10.1.1", "p4Change": "1", "buildId": "", "tag": "", "dcbVersion": 8, "p4kSize": 1},
+            "generatedAt": "2026-01-01T00:00:00Z",
+            "faction": {"id": "w", "name": "Wikelo", "scopes": []},
+            "emporiums": [], "contracts": [], "items": [], "favorConversions": []
+        }))
+        .expect("a dataset from before the field existed still reads");
+        assert!(ds.blueprints.is_empty());
+        assert!(!serde_json::to_string(&ds).unwrap().contains("blueprints"));
+
+        ds.blueprints = vec![Blueprint {
+            id: "bp1".into(),
+            name: "BP_CRAFT_x".into(),
+            category: Some("FPSWeapons".into()),
+            output_class_name: "x".into(),
+            output_name: "X".into(),
+            craft_time_sec: 150.0,
+            slots_required: Some(1),
+            slots: vec![BlueprintSlot {
+                name: "Frame".into(),
+                count: 1,
+                options: vec![CraftInput { kind: "resource".into(), name: "Iron".into(), qty: 0.02, unit: Unit::Scu, ..Default::default() }],
+                quantity_multipliers: vec![QuantityMultiplier { option: Some(0), multiplier: 1.15 }],
+                quality_effects: vec![QualityEffect {
+                    key: "gpp_weapon_damage".into(),
+                    name: None,
+                    ranges: vec![QualityRange { kind: QualityRangeKind::IntegerAdditive, start_quality: 0, end_quality: 249, at_start: -2.0, at_end: -2.0 }],
+                }],
+            }],
+            sources: vec![BlueprintSource { kind: "contract".into(), contract_id: "c1".into(), title: "T".into(), when: "complete".into(), pool: "P".into(), chance: 0.25, ..Default::default() }],
+            ..Default::default()
+        }];
+        let json = serde_json::to_string(&ds).unwrap();
+        assert!(json.contains(r#""kind":"integerAdditive""#), "{json}");
+        assert!(json.contains(r#""quantityMultipliers":[{"option":0,"multiplier":1.15}]"#), "{json}");
+        assert!(!json.contains("optionalSlots") && !json.contains("disabled") && !json.contains("displayName"), "empty optional parts stay out: {json}");
+        let back: WikeloDataset = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ds);
+    }
+
+    #[test]
+    fn quality_tiers_roundtrip_json_and_stay_out_when_empty() {
+        let mut ds: WikeloDataset = serde_json::from_value(serde_json::json!({
+            "schemaVersion": 1, "source": "test",
+            "build": {"channel": "LIVE", "branch": "b", "version": "4.10.1.1", "p4Change": "1", "buildId": "", "tag": "", "dcbVersion": 8, "p4kSize": 1},
+            "generatedAt": "2026-01-01T00:00:00Z",
+            "faction": {"id": "w", "name": "Wikelo", "scopes": []},
+            "emporiums": [], "contracts": [], "items": [], "favorConversions": []
+        }))
+        .expect("a dataset from before the field existed still reads");
+        assert!(ds.quality_tiers.is_empty());
+        assert!(!serde_json::to_string(&ds).unwrap().contains("qualityTiers"));
+
+        ds.quality_tiers = vec![QualityTiers {
+            key: "JumpingLimes".into(),
+            name: "Jumping Limes".into(),
+            bands: vec![QualityBand { start: 0, end: 399, value: 346 }, QualityBand { start: 400, end: 1000, value: 1000 }],
+        }];
+        let json = serde_json::to_string(&ds).unwrap();
+        assert!(
+            json.contains(r#""qualityTiers":[{"key":"JumpingLimes","name":"Jumping Limes","bands":[{"start":0,"end":399,"value":346},{"start":400,"end":1000,"value":1000}]}]"#),
+            "{json}"
+        );
         let back: WikeloDataset = serde_json::from_str(&json).unwrap();
         assert_eq!(back, ds);
     }

@@ -5,9 +5,10 @@
 //! Windows refused to hand over the keyboard…). Each of those moments writes one line here,
 //! with what the window manager answered, so a player can send the file along with a report.
 //!
-//! Only this computer's window-manager facts go in: this process's own window, and for the
-//! window in front its handle, owner ids, class and the first characters of its title. The
-//! file stays on this computer; nothing here is sent anywhere.
+//! Only this computer's window-manager facts go in: this process's own window; for the
+//! game's window its handle, owner ids, class and title; for a window of any other program
+//! only its class name and that it is another program, never its title. The file stays on
+//! this computer; nothing here is sent anywhere.
 
 use std::io::Write;
 use std::path::PathBuf;

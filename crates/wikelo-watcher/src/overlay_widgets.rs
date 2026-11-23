@@ -4,21 +4,29 @@
 //! change of location, the overlay's own warnings, the reward choices), the widgets menu
 //! (which cards, whether the search and the alerts are on, where the search strip sits, what
 //! Esc does), the search strip (what its one field lists, the filter chips and the groups,
-//! the inventory it reads), and the source pins (which converting items the closed overlay
-//! shows under a pinned one). No window here: everything is testable on its own.
+//! the inventory it reads), the blueprints card (its stack of screens, the rows in view, the
+//! details and the missions' blueprints it reads), and the source pins (which converting items the closed overlay shows
+//! under a pinned one). No window here: everything is testable on its own.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use crate::agent::OverlayWidget;
 use crate::overlay_model::{self as model, OverlayData};
-use crate::overlay_sync::{Outcome, next_delay};
+use crate::overlay_sync::{Limit, Outcome, next_delay};
 use crate::{tr, trf};
 
 /// Width of every card (logical px).
 pub const CARD_WIDTH: f32 = 320.0;
-/// Height of a card's header: the part of a card that must stay on screen.
+/// Height of a card's header at the normal text size: the part of a card that must stay on
+/// screen (see [`card_header_height`]).
 pub const CARD_HEADER: f32 = 28.0;
+
+/// Height of a card's header at text size `s`: it grows with the text, like the bodies (the
+/// normal height for a size that is not a positive number).
+pub fn card_header_height(s: f32) -> f32 {
+    if s.is_finite() && s > 0.0 { CARD_HEADER * s } else { CARD_HEADER }
+}
 /// Room between the default places and the edges of the screen, and between two cards.
 const EDGE: f32 = 24.0;
 /// Top of the default places, below the bar and the search strip the open overlay shows.
@@ -32,7 +40,7 @@ pub const MAX_CARD: [f32; 2] = [720.0, 1000.0];
 pub const TEXT_SCALES: [f32; 5] = [0.85, 1.0, 1.15, 1.3, 1.5];
 
 /// How many cards there are.
-pub const COUNT: usize = 5;
+pub const COUNT: usize = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Widget {
@@ -42,10 +50,13 @@ pub enum Widget {
     /// The list of records (notices); saved as `avisos`, its name before the alerts.
     Registros,
     Missoes,
+    /// Every blueprint of the channel, searchable, with whether the account has it; a row
+    /// opens to its craft or to where to get it. Drawn only while the overlay is open.
+    Blueprints,
 }
 
 impl Widget {
-    pub const ALL: [Widget; COUNT] = [Widget::Fixados, Widget::Falta, Widget::Aqui, Widget::Registros, Widget::Missoes];
+    pub const ALL: [Widget; COUNT] = [Widget::Fixados, Widget::Falta, Widget::Aqui, Widget::Registros, Widget::Missoes, Widget::Blueprints];
 
     /// Its place in [`Widget::ALL`] and in a layout.
     pub fn index(self) -> usize {
@@ -60,6 +71,7 @@ impl Widget {
             Widget::Aqui => "aqui",
             Widget::Registros => "avisos",
             Widget::Missoes => "missoes",
+            Widget::Blueprints => "blueprints",
         }
     }
 
@@ -71,6 +83,7 @@ impl Widget {
             Widget::Aqui => tr!("Here", "Aqui"),
             Widget::Registros => tr!("Records", "Registros"),
             Widget::Missoes => tr!("Missions", "Missões"),
+            Widget::Blueprints => tr!("Blueprints", "Blueprints"),
         }
     }
 }
@@ -206,7 +219,9 @@ pub fn clamp_layout(layout: &mut Layout, cards: &[[f32; 2]; COUNT], screen: [f32
 }
 
 /// The first-time layout: "Fixados" and, left of it, "Falta" pinned at the top right;
-/// "Registros", "Aqui" and "Missões" unpinned (seen only while the overlay is open).
+/// "Registros", "Aqui" and "Missões" unpinned (seen only while the overlay is open), and
+/// "Blueprints" unpinned under "Missões", from the middle of the screen down (the top row has
+/// no room left for a sixth card).
 pub fn default_place(w: Widget, screen: [f32; 2]) -> CardPlace {
     let from_right = |n: f32| screen[0] - n * (CARD_WIDTH + EDGE);
     let (x, y, pinned) = match w {
@@ -215,6 +230,7 @@ pub fn default_place(w: Widget, screen: [f32; 2]) -> CardPlace {
         Widget::Registros => (EDGE, TOP, false),
         Widget::Aqui => (2.0 * EDGE + CARD_WIDTH, TOP, false),
         Widget::Missoes => (from_right(3.0), TOP, false),
+        Widget::Blueprints => (from_right(3.0), screen[1] / 2.0, false),
     };
     CardPlace { frac: clamp_frac(to_frac([x, y], screen), [CARD_WIDTH, CARD_HEADER], screen), pinned, size: None }
 }
@@ -288,8 +304,16 @@ pub enum Part {
 
 impl Part {
     /// Every switch, in the menu's order: the cards, the search, the alerts.
-    pub const ALL: [Part; PARTS] =
-        [Part::Card(Widget::Fixados), Part::Card(Widget::Falta), Part::Card(Widget::Aqui), Part::Card(Widget::Registros), Part::Card(Widget::Missoes), Part::Search, Part::Alerts];
+    pub const ALL: [Part; PARTS] = [
+        Part::Card(Widget::Fixados),
+        Part::Card(Widget::Falta),
+        Part::Card(Widget::Aqui),
+        Part::Card(Widget::Registros),
+        Part::Card(Widget::Missoes),
+        Part::Card(Widget::Blueprints),
+        Part::Search,
+        Part::Alerts,
+    ];
 
     fn index(self) -> usize {
         match self {
@@ -315,6 +339,12 @@ impl Part {
             Part::Search => tr!("Search", "Busca"),
             Part::Alerts => tr!("Alerts", "Alertas"),
         }
+    }
+
+    /// Listed in the widgets menu: every switch but the blueprints card's, which has a button
+    /// of its own in the bar (shown or not, it is saved like the others).
+    pub fn in_menu(self) -> bool {
+        self != Part::Card(Widget::Blueprints)
     }
 }
 
@@ -657,7 +687,8 @@ pub enum Filter {
     Missoes,
 }
 
-/// The groups the results come in, each under its heading, in this order.
+/// The groups the results come in, each under its heading, in this order. Blueprints are
+/// searched only in their own card.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Group {
     Inventario,
@@ -673,9 +704,8 @@ impl Group {
     }
 }
 
-/// The chips for a text whose search found `items` items and `missions` missions: none
-/// when it found nothing; else "Tudo" and one chip per group that has results, with its
-/// count.
+/// The chips for a text whose search found `items` items and `missions` missions: none when
+/// it found nothing; else "Tudo" and one chip per group that has results, with its count.
 pub fn chips(items: usize, missions: usize) -> Vec<(Filter, String)> {
     if items == 0 && missions == 0 {
         return Vec::new();
@@ -1042,6 +1072,261 @@ impl LocationsFetch {
     }
 }
 
+// ----- the blueprints card --------------------------------------------------------------
+
+/// What a screen of the blueprints card shows of one blueprint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BpPanel {
+    /// The blueprint and its craft (a click on its name in the list or in a mission's pool).
+    Craft,
+    /// The missions that give it ("Onde conseguir", from the list or from its craft screen).
+    Where,
+}
+
+/// A screen of the blueprints card. The card shows one screen at a time: the list (nothing
+/// on the [`ScreenStack`]) or the screen on top of the stack, with "Voltar" at the top.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum BpScreen {
+    /// One blueprint (its key), and which of its screens.
+    Blueprint(String, BpPanel),
+    /// The blueprints a mission gives ("Blueprints da missão", a click on a line of "Onde
+    /// conseguir"): its contract id, and the title and giver of that line, drawn until the
+    /// mission's answer comes.
+    Mission { contract: String, title: String, giver: Option<String> },
+}
+
+impl BpScreen {
+    /// The blueprint this screen is about, if it is one of a blueprint's screens.
+    pub fn blueprint(&self) -> Option<&str> {
+        match self {
+            BpScreen::Blueprint(key, _) => Some(key.as_str()),
+            BpScreen::Mission { .. } => None,
+        }
+    }
+
+    /// The contract this screen is about, if it is a mission's screen.
+    pub fn contract(&self) -> Option<&str> {
+        match self {
+            BpScreen::Mission { contract, .. } => Some(contract.as_str()),
+            BpScreen::Blueprint(..) => None,
+        }
+    }
+}
+
+/// Most screens kept on the stack; past it the oldest are dropped (their "Voltar" then ends
+/// at the list sooner).
+pub const SCREENS_MAX: usize = 16;
+
+/// The screens opened since the list, oldest first, the one shown last. "Voltar" goes back
+/// one screen, however deep (list -> blueprint -> onde conseguir -> missão -> another
+/// blueprint -> ...).
+pub type ScreenStack = Vec<BpScreen>;
+
+/// Open `screen` over the ones on `stack`; the screen already on top again changes nothing.
+/// Past [`SCREENS_MAX`] the oldest screens are dropped.
+pub fn screen_push(stack: &mut ScreenStack, screen: BpScreen) {
+    if stack.last() == Some(&screen) {
+        return;
+    }
+    stack.push(screen);
+    if stack.len() > SCREENS_MAX {
+        let extra = stack.len() - SCREENS_MAX;
+        stack.drain(..extra);
+    }
+}
+
+/// "Voltar": the screen on top goes, and the one under it shows again (none left: the list).
+pub fn screen_back(stack: &mut ScreenStack) {
+    let _ = stack.pop();
+}
+
+/// Where "Voltar" on the top screen of `stack` leads, for its hover text.
+pub fn back_hint(stack: &[BpScreen]) -> &'static str {
+    match stack.len().checked_sub(2).and_then(|i| stack.get(i)) {
+        None => tr!("back to the list", "voltar para a lista"),
+        Some(BpScreen::Blueprint(_, BpPanel::Craft)) => tr!("back to the blueprint", "voltar para a blueprint"),
+        Some(BpScreen::Blueprint(_, BpPanel::Where)) => tr!("back to where to get it", "voltar para onde conseguir"),
+        Some(BpScreen::Mission { .. }) => tr!("back to the mission", "voltar para a missão"),
+    }
+}
+
+/// The blueprint whose detail the top screen of `stack` draws (its craft or its missions).
+pub fn open_blueprint(stack: &[BpScreen]) -> Option<&str> {
+    stack.last().and_then(|s| s.blueprint())
+}
+
+/// The contract whose blueprints the top screen of `stack` draws.
+pub fn open_contract(stack: &[BpScreen]) -> Option<&str> {
+    stack.last().and_then(|s| s.contract())
+}
+
+/// Which of `count` rows of `pitch` px each, laid out from `top`, fall inside the visible
+/// band from `clip_top` to `clip_bottom` (one more on each side for a row cut in half): the
+/// card lays out only those, and leaves the room of the others empty, so a list of thousands
+/// costs a screenful of rows per frame.
+pub fn visible_rows(top: f32, clip_top: f32, clip_bottom: f32, count: usize, pitch: f32) -> std::ops::Range<usize> {
+    if count == 0 || !pitch.is_finite() || pitch <= 0.0 || !top.is_finite() || !clip_top.is_finite() || !clip_bottom.is_finite() {
+        return 0..0;
+    }
+    // A float cast to usize saturates: far below the band is 0, far past it is `count`.
+    let first = (((clip_top - top) / pitch).floor().max(0.0) as usize).min(count);
+    let end = ((((clip_bottom - top) / pitch).ceil().max(0.0) as usize).saturating_add(1)).min(count);
+    first.min(end)..end
+}
+
+/// Blueprint details (and missions' blueprints) kept for the session; past it, they are all
+/// forgotten but the one arriving (a few hundred screens opened is far more than a session
+/// sees).
+pub const DETAILS_KEPT: usize = 200;
+
+/// What a request for one keyed thing got: a blueprint's detail ([`DetailAnswer`]) or a
+/// mission's blueprints ([`MissionAnswer`]).
+#[derive(Debug, PartialEq)]
+pub enum KeyedAnswer<T> {
+    /// What was asked for and its ETag (none when the server sent none).
+    Data(T, Option<String>),
+    /// 304: what is held is still the server's.
+    NotModified,
+    /// No answer or an error, the server's sentence, and whether it was a 429.
+    Failed(String, Option<Limit>),
+}
+
+/// What a request for a blueprint's detail got.
+pub type DetailAnswer = KeyedAnswer<model::BlueprintDetail>;
+/// What a request for a mission's blueprints got.
+pub type MissionAnswer = KeyedAnswer<model::MissionBlueprints>;
+
+/// The details of the blueprints opened in the card, by key.
+pub type DetailFetch = KeyedFetch<model::BlueprintDetail>;
+/// The blueprints of the missions opened in the card, by contract.
+pub type MissionFetch = KeyedFetch<model::MissionBlueprints>;
+
+/// What the screens of the blueprints card read, kept for the session, each with its ETag: a
+/// screen opened asks for what it draws (again, with `If-None-Match` when it is held: a 304
+/// keeps it), one request at a time. A failure is said on the screen (what was held stays)
+/// and asked again only when the screen is opened again, or after the wait of a 429 while it
+/// is still open. At most [`DETAILS_KEPT`] are kept.
+#[derive(Debug)]
+pub struct KeyedFetch<T> {
+    held: HashMap<String, (T, Option<String>)>,
+    /// The screen opened whose request has not gone out yet.
+    wanted: Option<String>,
+    in_flight: Option<String>,
+    /// The last failure, and the key it was for.
+    error: Option<(String, String)>,
+}
+
+impl<T> Default for KeyedFetch<T> {
+    fn default() -> Self {
+        Self { held: HashMap::new(), wanted: None, in_flight: None, error: None }
+    }
+}
+
+impl<T> KeyedFetch<T> {
+    /// The screen of `key` was opened: what it draws is asked for.
+    pub fn open(&mut self, key: &str) {
+        self.wanted = Some(key.to_string());
+        if self.error.as_ref().is_some_and(|(k, _)| k == key) {
+            self.error = None;
+        }
+    }
+
+    /// The open screen was left: nothing more is asked for it.
+    pub fn close(&mut self) {
+        self.wanted = None;
+    }
+
+    /// The request to send now (the key), if one is wanted and none is on its way.
+    pub fn due(&mut self) -> Option<String> {
+        if self.in_flight.is_some() {
+            return None;
+        }
+        let key = self.wanted.take()?;
+        self.in_flight = Some(key.clone());
+        Some(key)
+    }
+
+    /// A request waits for its turn.
+    pub fn waiting(&self) -> bool {
+        self.wanted.is_some() && self.in_flight.is_none()
+    }
+
+    /// The ETag of what is held for `key`, sent with its request.
+    pub fn etag(&self, key: &str) -> Option<String> {
+        self.held.get(key).and_then(|(_, etag)| etag.clone())
+    }
+
+    /// The answer for `key` (`still_open`: its screen is still the open one). An answer for
+    /// anything but the request on its way is dropped.
+    pub fn answer(&mut self, key: &str, answer: KeyedAnswer<T>, still_open: bool) {
+        if self.in_flight.as_deref() != Some(key) {
+            return;
+        }
+        self.in_flight = None;
+        match answer {
+            KeyedAnswer::Data(data, etag) => {
+                if self.held.len() >= DETAILS_KEPT && !self.held.contains_key(key) {
+                    self.held.clear();
+                }
+                self.held.insert(key.to_string(), (data, etag));
+                self.clear_error(key);
+            }
+            KeyedAnswer::NotModified if self.held.contains_key(key) => self.clear_error(key),
+            // Nothing held to keep (cannot happen: the ETag goes only with data held): asked
+            // again, whole.
+            KeyedAnswer::NotModified => self.again(key, still_open),
+            KeyedAnswer::Failed(error, limit) => {
+                self.error = Some((key.to_string(), error));
+                // A 429: asked again once the engine's wait is over, if the screen is still open.
+                if limit.is_some() {
+                    self.again(key, still_open);
+                }
+            }
+        }
+    }
+
+    /// Something is held for `key` (a screen gone back to draws it without asking again).
+    pub fn has(&self, key: &str) -> bool {
+        self.held.contains_key(key)
+    }
+
+    /// The request for `key` will never be answered (an endpoint left behind): asked again
+    /// while its screen is open.
+    pub fn cancel(&mut self, key: &str, still_open: bool) {
+        if self.in_flight.as_deref() == Some(key) {
+            self.in_flight = None;
+            self.again(key, still_open);
+        }
+    }
+
+    fn again(&mut self, key: &str, still_open: bool) {
+        if still_open && self.wanted.is_none() {
+            self.wanted = Some(key.to_string());
+        }
+    }
+
+    fn clear_error(&mut self, key: &str) {
+        if self.error.as_ref().is_some_and(|(k, _)| k == key) {
+            self.error = None;
+        }
+    }
+
+    /// What is held for `key`.
+    pub fn get(&self, key: &str) -> Option<&T> {
+        self.held.get(key).map(|(data, _)| data)
+    }
+
+    /// Why the last request for `key` failed (none since an answer for it).
+    pub fn error(&self, key: &str) -> Option<&str> {
+        self.error.as_ref().filter(|(k, _)| k == key).map(|(_, e)| e.as_str())
+    }
+
+    /// Another endpoint: nothing known.
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
 // ----- source pins ----------------------------------------------------------------------
 
 /// Most source pins kept (an item pinned and an item that converts into it).
@@ -1102,8 +1387,8 @@ mod tests {
 
     #[test]
     fn widgets_have_stable_names() {
-        assert_eq!(Widget::ALL.map(Widget::key), ["fixados", "falta", "aqui", "avisos", "missoes"]);
-        assert_eq!(Widget::ALL.map(Widget::title), ["Fixados", "Falta", "Aqui", "Registros", "Missões"]);
+        assert_eq!(Widget::ALL.map(Widget::key), ["fixados", "falta", "aqui", "avisos", "missoes", "blueprints"]);
+        assert_eq!(Widget::ALL.map(Widget::title), ["Fixados", "Falta", "Aqui", "Registros", "Missões", "Blueprints"]);
         assert_eq!(Widget::Registros.key(), "avisos", "the records keep the saved name of the old card: no layout is lost");
         for (i, w) in Widget::ALL.iter().enumerate() {
             assert_eq!(w.index(), i);
@@ -1118,7 +1403,8 @@ mod tests {
         assert_eq!(px(l[Widget::Registros.index()], FHD), [24.0, 150.0]);
         assert_eq!(px(l[Widget::Aqui.index()], FHD), [368.0, 150.0]);
         assert_eq!(px(l[Widget::Missoes.index()], FHD), [888.0, 150.0], "left of Falta");
-        assert_eq!(l.map(|p| p.pinned), [true, true, false, false, false], "Missões is off by default");
+        assert_eq!(px(l[Widget::Blueprints.index()], FHD), [888.0, 540.0], "under Missões, from the middle down");
+        assert_eq!(l.map(|p| p.pinned), [true, true, false, false, false, false], "Missões and Blueprints are off by default");
         assert!(l.iter().all(|p| p.size.is_none()), "every card at its normal size");
         // A small screen still keeps every card on it.
         let tiny = [500.0, 300.0];
@@ -1126,6 +1412,41 @@ mod tests {
             let [x, y] = px(p, tiny);
             assert!((0.0..=500.0 - CARD_WIDTH).contains(&x) && (0.0..=300.0 - CARD_HEADER).contains(&y), "{p:?}");
         }
+    }
+
+    #[test]
+    fn the_blueprints_card_has_a_place_of_its_own_and_loads_from_an_older_file() {
+        // Its default place covers none of the others', even with every card 360 px tall.
+        let overlaps = |a: CardPlace, b: CardPlace, screen: [f32; 2], h: f32| {
+            let ([ax, ay], [bx, by]) = ([a.frac[0] * screen[0], a.frac[1] * screen[1]], [b.frac[0] * screen[0], b.frac[1] * screen[1]]);
+            ax < bx + CARD_WIDTH && bx < ax + CARD_WIDTH && ay < by + h && by < ay + h
+        };
+        for (screen, h) in [(FHD, 360.0), ([1280.0, 720.0], 200.0), ([2560.0, 1440.0], 360.0)] {
+            let l = resolve(&BTreeMap::new(), None, screen);
+            let bp = l[Widget::Blueprints.index()];
+            for w in Widget::ALL.into_iter().filter(|w| *w != Widget::Blueprints) {
+                assert!(!overlaps(bp, l[w.index()], screen, h), "{w:?} on {screen:?}");
+            }
+        }
+        // A watcher.json written before the card: it sits at its default place, and is saved
+        // from then on.
+        let old: crate::agent::AgentConfig = serde_json::from_str(r#"{"server":"https://x","token":"t","handle":"h","overlay_widgets":{"fixados":{"x":0.1,"y":0.1,"pinned":true}},"overlay_hidden":["missoes"]}"#).unwrap();
+        let l = resolve(&old.overlay_widgets, None, FHD);
+        assert_eq!(l[Widget::Blueprints.index()], default_place(Widget::Blueprints, FHD));
+        assert_eq!(l[Widget::Fixados.index()], at([0.1, 0.1], true), "the saved cards as they were");
+        assert!(to_config(&l).contains_key("blueprints"));
+        let shown = Shown::from_saved(&old.overlay_hidden);
+        assert!(shown.get(Part::Card(Widget::Blueprints)) && !shown.get(Part::Card(Widget::Missoes)), "shown unless switched off");
+        // Switched off like any card, and back from watcher.json.
+        let mut s = Shown::default();
+        assert!(s.set(Part::Card(Widget::Blueprints), false));
+        let hidden: Vec<String> = s.to_config().into_iter().filter(|(_, on)| !*on).map(|(k, _)| k).collect();
+        assert_eq!(hidden, vec!["blueprints".to_string()]);
+        assert_eq!(Shown::from_saved(&hidden), s);
+        // Its place and size round-trip like the others'.
+        let mut l = resolve(&BTreeMap::new(), None, FHD);
+        l[Widget::Blueprints.index()] = CardPlace { frac: [0.4, 0.3], pinned: true, size: Some([0.25, 0.5]) };
+        assert_eq!(resolve(&to_config(&l), None, FHD), l);
     }
 
     #[test]
@@ -1294,7 +1615,7 @@ mod tests {
         l[Widget::Aqui.index()] = at([0.3, 0.6], true);
         l[Widget::Missoes.index()] = CardPlace { frac: [0.1, 0.2], pinned: true, size: Some([0.25, 0.5]) };
         let saved = to_config(&l);
-        assert_eq!(saved.keys().map(String::as_str).collect::<Vec<_>>(), vec!["aqui", "avisos", "falta", "fixados", "missoes"]);
+        assert_eq!(saved.keys().map(String::as_str).collect::<Vec<_>>(), vec!["aqui", "avisos", "blueprints", "falta", "fixados", "missoes"]);
         assert_eq!(saved["aqui"], ow(0.3, 0.6, true));
         assert_eq!(saved["missoes"], OverlayWidget { x: 0.1, y: 0.2, pinned: true, w: Some(0.25), h: Some(0.5) });
         assert_eq!(resolve(&saved, Some([0.0, 0.0]), FHD), l, "the old position is ignored once cards are saved");
@@ -1507,15 +1828,15 @@ mod tests {
     #[test]
     fn cards_come_to_the_front_when_touched() {
         let mut z = default_z();
-        assert_eq!(z, [0, 1, 2, 3, 4]);
+        assert_eq!(z, [0, 1, 2, 3, 4, 5]);
         raise(&mut z, 1);
-        assert_eq!(z, [0, 2, 3, 4, 1]);
+        assert_eq!(z, [0, 2, 3, 4, 5, 1]);
         raise(&mut z, 1);
-        assert_eq!(z, [0, 2, 3, 4, 1], "already in front");
+        assert_eq!(z, [0, 2, 3, 4, 5, 1], "already in front");
         raise(&mut z, 0);
-        assert_eq!(z, [2, 3, 4, 1, 0]);
+        assert_eq!(z, [2, 3, 4, 5, 1, 0]);
         raise(&mut z, 9);
-        assert_eq!(z, [2, 3, 4, 1, 0], "no such card");
+        assert_eq!(z, [2, 3, 4, 5, 1, 0], "no such card");
     }
 
     #[test]
@@ -1676,6 +1997,226 @@ mod tests {
         assert_eq!(groups(effective_filter(Filter::Missoes, 7, 0), 7, 0), vec![Group::Inventario]);
     }
 
+    fn craft(k: &str) -> BpScreen {
+        BpScreen::Blueprint(k.to_string(), BpPanel::Craft)
+    }
+
+    fn place(k: &str) -> BpScreen {
+        BpScreen::Blueprint(k.to_string(), BpPanel::Where)
+    }
+
+    fn mission(c: &str) -> BpScreen {
+        BpScreen::Mission { contract: c.to_string(), title: "T".into(), giver: None }
+    }
+
+    #[test]
+    fn back_on_a_blueprint_screen_goes_one_screen_up() {
+        // The craft screen: back to the list.
+        let mut s = ScreenStack::new();
+        screen_push(&mut s, craft("BP_a"));
+        screen_back(&mut s);
+        assert!(s.is_empty());
+        // "Onde conseguir" opened from the craft screen: back to it, then to the list.
+        screen_push(&mut s, craft("BP_a"));
+        screen_push(&mut s, place("BP_a"));
+        screen_back(&mut s);
+        assert_eq!(s.last(), Some(&craft("BP_a")));
+        screen_back(&mut s);
+        assert!(s.is_empty());
+        // Opened from the list: back to the list.
+        screen_push(&mut s, place("BP_a"));
+        screen_back(&mut s);
+        assert!(s.is_empty());
+        // The list: nowhere to go back to.
+        screen_back(&mut s);
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn back_returns_to_the_previous_screen_however_deep() {
+        let mut s = ScreenStack::new();
+        for screen in [craft("BP_a"), place("BP_a"), mission("c1"), craft("BP_b"), place("BP_b"), mission("c2")] {
+            screen_push(&mut s, screen);
+        }
+        assert_eq!((open_contract(&s), open_blueprint(&s)), (Some("c2"), None));
+        assert_eq!(back_hint(&s), "voltar para onde conseguir");
+        let mut seen = Vec::new();
+        while let Some(top) = s.last().cloned() {
+            seen.push(top);
+            screen_back(&mut s);
+        }
+        assert_eq!(seen, vec![mission("c2"), place("BP_b"), craft("BP_b"), mission("c1"), place("BP_a"), craft("BP_a")], "each screen in turn, back to the list");
+        // The screen on top again changes nothing; the same blueprint further up is a screen of its own.
+        screen_push(&mut s, craft("BP_a"));
+        screen_push(&mut s, craft("BP_a"));
+        assert_eq!(s.len(), 1);
+        assert_eq!(back_hint(&s), "voltar para a lista");
+        screen_push(&mut s, place("BP_a"));
+        assert_eq!((back_hint(&s), open_blueprint(&s)), ("voltar para a blueprint", Some("BP_a")));
+        screen_push(&mut s, mission("c1"));
+        screen_push(&mut s, craft("BP_a"));
+        assert_eq!((s.len(), back_hint(&s)), (4, "voltar para a missão"));
+    }
+
+    #[test]
+    fn the_stack_of_screens_is_bounded_and_drops_the_oldest() {
+        let mut s = ScreenStack::new();
+        for n in 0..SCREENS_MAX + 5 {
+            screen_push(&mut s, craft(&format!("BP_{n}")));
+        }
+        assert_eq!(s.len(), SCREENS_MAX);
+        assert_eq!(s.first(), Some(&craft("BP_5")), "the oldest dropped");
+        assert_eq!(s.last(), Some(&craft(&format!("BP_{}", SCREENS_MAX + 4))), "the newest on top");
+        for _ in 0..SCREENS_MAX {
+            screen_back(&mut s);
+        }
+        assert!(s.is_empty(), "back to the list after as many steps as are kept");
+    }
+
+    #[test]
+    fn a_mission_screen_asks_for_its_blueprints_like_a_row_asks_for_its_detail() {
+        let mut f = MissionFetch::default();
+        f.open("c1");
+        assert_eq!(f.due(), Some("c1".to_string()));
+        assert_eq!(f.due(), None, "one request at a time");
+        let m = model::MissionBlueprints { title: "T".into(), ..Default::default() };
+        f.answer("c1", MissionAnswer::Data(m.clone(), Some("\"m1\"".into())), true);
+        assert_eq!((f.get("c1"), f.has("c1"), f.etag("c1").as_deref()), (Some(&m), true, Some("\"m1\"")));
+        // Opened again: asked again with its ETag; a 304 keeps it.
+        f.open("c1");
+        assert_eq!(f.due(), Some("c1".to_string()));
+        f.answer("c1", MissionAnswer::NotModified, true);
+        assert_eq!((f.get("c1"), f.error("c1")), (Some(&m), None));
+        // A failure says the server's sentence; another endpoint forgets everything.
+        f.open("c2");
+        f.due();
+        f.answer("c2", MissionAnswer::Failed("O site ainda não tem as blueprints por missão.".into(), None), true);
+        assert_eq!((f.get("c2"), f.error("c2")), (None, Some("O site ainda não tem as blueprints por missão.")));
+        f.reset();
+        assert!(!f.has("c1"));
+    }
+
+    #[test]
+    fn the_blueprints_card_has_its_button_in_the_bar_not_in_the_menu() {
+        let listed: Vec<Part> = Part::ALL.into_iter().filter(|p| p.in_menu()).collect();
+        assert_eq!(listed.iter().map(|p| p.key()).collect::<Vec<_>>(), vec!["fixados", "falta", "aqui", "avisos", "missoes", "pesquisa", "alertas"]);
+        // Hidden by its close button or its bar button: the same switch, saved the same way.
+        let mut s = Shown::default();
+        assert!(s.set(Part::Card(Widget::Blueprints), false));
+        assert_eq!(Shown::from_saved(&["blueprints".to_string()]), s);
+    }
+
+    #[test]
+    fn the_header_grows_with_the_text() {
+        assert_eq!(card_header_height(1.0), CARD_HEADER);
+        assert_eq!(card_header_height(1.5), CARD_HEADER * 1.5);
+        assert_eq!(card_header_height(0.85), CARD_HEADER * 0.85);
+        for odd in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            assert_eq!(card_header_height(odd), CARD_HEADER, "{odd}");
+        }
+        // A card as tall as its header near the bottom is kept on screen at the larger size.
+        let mut l = resolve(&BTreeMap::new(), None, FHD);
+        l[0].frac = [0.5, (1080.0 - CARD_HEADER) / 1080.0];
+        let header = [CARD_WIDTH, card_header_height(1.5)];
+        assert!(clamp_layout(&mut l, &[header; COUNT], FHD));
+        assert!(l[0].frac[1] * 1080.0 + card_header_height(1.5) <= 1080.0 + 0.01);
+    }
+
+    #[test]
+    fn only_the_rows_in_view_are_laid_out() {
+        // 20 px a row from y = 100; the band shows y 300 to 500.
+        assert_eq!(visible_rows(100.0, 300.0, 500.0, 5000, 20.0), 10..21, "rows 10 to 19, and the one cut at the bottom");
+        assert_eq!(visible_rows(100.0, 0.0, 200.0, 5000, 20.0), 0..6, "the top of the list");
+        assert_eq!(visible_rows(100.0, 0.0, 10_000_000.0, 5000, 20.0), 0..5000, "never past the list");
+        assert_eq!(visible_rows(100.0, 200_000.0, 200_400.0, 5000, 20.0), 5000..5000, "scrolled past it: none");
+        assert_eq!(visible_rows(100.0, 300.0, 500.0, 0, 20.0), 0..0);
+        for pitch in [0.0, -3.0, f32::NAN, f32::INFINITY] {
+            assert_eq!(visible_rows(100.0, 300.0, 500.0, 50, pitch), 0..0, "{pitch}");
+        }
+        assert_eq!(visible_rows(f32::NAN, 300.0, 500.0, 50, 20.0), 0..0);
+        // A screenful, however long the list.
+        let r = visible_rows(0.0, 1_000_000.0, 1_000_600.0, 1_000_000, 20.0);
+        assert!(r.len() <= 32, "{r:?}");
+    }
+
+    fn some_detail() -> model::BlueprintDetail {
+        model::BlueprintDetail { craft_time_sec: 90.0, ..Default::default() }
+    }
+
+    #[test]
+    fn a_row_opened_asks_for_its_detail_once_and_again_with_its_etag_when_opened_again() {
+        let mut f = DetailFetch::default();
+        assert_eq!(f.due(), None, "nothing opened");
+        f.open("BP_a");
+        assert!(f.waiting());
+        assert_eq!(f.due(), Some("BP_a".to_string()));
+        assert_eq!((f.due(), f.waiting()), (None, false), "one request at a time");
+        assert_eq!(f.etag("BP_a"), None, "nothing held: no ETag");
+        f.answer("BP_a", DetailAnswer::Data(some_detail(), Some("\"e1\"".into())), true);
+        assert_eq!(f.get("BP_a"), Some(&some_detail()));
+        assert_eq!(f.due(), None, "kept: not asked again while open");
+        // Opened again: asked again, with its ETag; a 304 keeps it.
+        f.open("BP_a");
+        assert_eq!(f.due(), Some("BP_a".to_string()));
+        assert_eq!(f.etag("BP_a").as_deref(), Some("\"e1\""));
+        f.answer("BP_a", DetailAnswer::NotModified, true);
+        assert_eq!((f.get("BP_a"), f.error("BP_a")), (Some(&some_detail()), None));
+        // A row closed before its request went out: not asked.
+        f.open("BP_b");
+        f.close();
+        assert_eq!(f.due(), None);
+        // An answer for anything but the request on its way is dropped.
+        f.answer("BP_b", DetailAnswer::Data(some_detail(), None), true);
+        assert_eq!(f.get("BP_b"), None);
+    }
+
+    #[test]
+    fn a_failed_detail_says_why_keeps_what_was_held_and_a_429_asks_again_while_open() {
+        let mut f = DetailFetch::default();
+        f.open("BP_a");
+        f.due();
+        f.answer("BP_a", DetailAnswer::Data(some_detail(), None), true);
+        f.open("BP_a");
+        f.due();
+        f.answer("BP_a", DetailAnswer::Failed("canal sem dados".into(), None), true);
+        assert_eq!((f.error("BP_a"), f.get("BP_a").is_some()), (Some("canal sem dados"), true), "the server's sentence; the detail held stays");
+        assert_eq!(f.error("BP_b"), None, "said under its own row only");
+        assert_eq!(f.due(), None, "not asked again until opened again");
+        f.open("BP_a");
+        assert_eq!(f.error("BP_a"), None, "opened again: asked afresh");
+        // A 429: asked again (the engine holds it back for the server's wait), if still open.
+        f.due();
+        f.answer("BP_a", DetailAnswer::Failed("consultas demais".into(), Some(Limit(None))), true);
+        assert_eq!(f.due(), Some("BP_a".to_string()));
+        f.answer("BP_a", DetailAnswer::Failed("consultas demais".into(), Some(Limit(None))), false);
+        assert_eq!(f.due(), None, "closed meanwhile: not asked");
+        // A 304 with nothing held is asked again whole.
+        f.open("BP_c");
+        f.due();
+        f.answer("BP_c", DetailAnswer::NotModified, true);
+        assert_eq!((f.due(), f.etag("BP_c")), (Some("BP_c".to_string()), None));
+        // An endpoint left behind: asked again while open; another endpoint forgets everything.
+        f.cancel("BP_c", true);
+        assert_eq!(f.due(), Some("BP_c".to_string()));
+        f.cancel("BP_c", false);
+        assert_eq!(f.due(), None);
+        f.reset();
+        assert_eq!(f.get("BP_a"), None);
+    }
+
+    #[test]
+    fn the_details_kept_are_bounded() {
+        let mut f = DetailFetch::default();
+        for n in 0..DETAILS_KEPT + 5 {
+            let key = format!("BP_{n}");
+            f.open(&key);
+            assert_eq!(f.due(), Some(key.clone()));
+            f.answer(&key, DetailAnswer::Data(some_detail(), None), true);
+        }
+        assert!(f.held.len() <= DETAILS_KEPT);
+        assert!(f.get(&format!("BP_{}", DETAILS_KEPT + 4)).is_some(), "the one arriving is kept");
+    }
+
     fn held(ids: &[(&str, f64)]) -> HashMap<String, model::Owned> {
         ids.iter().map(|&(id, qty)| (id.to_string(), model::Owned { qty, stacks: vec![] })).collect()
     }
@@ -1785,8 +2326,8 @@ mod tests {
 
     #[test]
     fn the_widgets_menu_lists_every_card_and_the_search() {
-        assert_eq!(Part::ALL.map(Part::key), ["fixados", "falta", "aqui", "avisos", "missoes", "pesquisa", "alertas"]);
-        assert_eq!(Part::ALL.map(Part::title), ["Fixados", "Falta", "Aqui", "Registros", "Missões", "Busca", "Alertas"]);
+        assert_eq!(Part::ALL.map(Part::key), ["fixados", "falta", "aqui", "avisos", "missoes", "blueprints", "pesquisa", "alertas"]);
+        assert_eq!(Part::ALL.map(Part::title), ["Fixados", "Falta", "Aqui", "Registros", "Missões", "Blueprints", "Busca", "Alertas"]);
         assert!(!Widget::ALL.iter().any(|w| [SEARCH_KEY, ALERTS_KEY, "busca"].contains(&w.key())), "the search and the alerts have names of their own");
         assert!(Shown::default().get(Part::Alerts), "the alerts are on by default");
         for (i, p) in Part::ALL.iter().enumerate() {

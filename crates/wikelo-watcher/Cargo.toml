@@ -45,7 +45,6 @@ sha2 = "0.10"
 zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 directories = "6"
 ureq = { version = "3", features = ["json"] }
-rpassword = "7"
 ctrlc = "3"
 
 [target.'cfg(windows)'.dependencies]

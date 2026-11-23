@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::dataset::*;
-use crate::history::{contract_fingerprint, version_key};
+use crate::history::{build_order, contract_fingerprint, p4_change_number, version_key};
 
 /// Bumped whenever the canonical form changes (older hashes stop being comparable).
 pub const HASH_VERSION: &str = "v1";
@@ -24,6 +24,30 @@ pub const MAX_MISSION_DROPS: usize = 20_000;
 pub const MAX_MISSIONS: usize = 20_000;
 pub const MAX_LOCATIONS: usize = 5000;
 pub const MAX_WARNINGS: usize = 2000;
+/// The game has about 1600; room for growth, not for a hostile bundle.
+pub const MAX_BLUEPRINTS: usize = 10_000;
+/// Sources over every blueprint (a pool lists up to ~20 blueprints, ~1100 results draw from pools).
+pub const MAX_BLUEPRINT_SOURCES: usize = 200_000;
+/// Per blueprint: slots, options per slot, effects per slot, multipliers per slot.
+pub const MAX_BLUEPRINT_PARTS: usize = 64;
+/// Quality bands of one effect (the game's have up to five).
+pub const MAX_QUALITY_RANGES: usize = 32;
+/// Sources of one blueprint.
+pub const MAX_SOURCES_PER_BLUEPRINT: usize = 5000;
+/// Every blueprint together, serialized as JSON (the game's come to about 4.6 MB).
+pub const MAX_BLUEPRINTS_BYTES: usize = 16 * 1024 * 1024;
+/// One year; the game's craft times are minutes.
+pub const MAX_CRAFT_TIME_SEC: f64 = 31_536_000.0;
+/// Largest ingredient quantity, modifier or multiplier taken as real (the game's are below 100).
+pub const MAX_BLUEPRINT_VALUE: f64 = 1_000_000.0;
+/// The game's quality scale.
+pub const MAX_QUALITY: i64 = 1000;
+/// Materials with quality tiers (the game has 63).
+pub const MAX_QUALITY_TIERS: usize = 400;
+/// Bands of one material's quality tiers (the game's have eight).
+pub const MAX_QUALITY_BANDS: usize = 16;
+/// Longest key or name of a material's quality tiers.
+pub const MAX_QUALITY_TIER_TEXT: usize = 64;
 /// Location ids are game class names (`Pyro1_ASD_Monorail_LazarusTransportHub_Phoenix_1A`).
 const MAX_LOCATION_ID: usize = 128;
 const MAX_SHORT: usize = 200;
@@ -85,6 +109,13 @@ fn canonicalize(ds: &WikeloDataset) -> WikeloDataset {
     c.mission_drops.sort_by(|a, b| (&a.contract_id, &a.item_id).cmp(&(&b.contract_id, &b.item_id)));
     c.missions.sort_by(|a, b| a.id.cmp(&b.id));
     c.locations.sort_by(|a, b| a.id.cmp(&b.id));
+    // Slots, options and ranges keep the record's order, which means something; sources do not.
+    c.blueprints.sort_by(|a, b| a.id.cmp(&b.id));
+    for bp in &mut c.blueprints {
+        bp.sources.sort_by(|a, b| (&a.contract_id, &a.when, &a.pool).cmp(&(&b.contract_id, &b.when, &b.pool)).then(a.chance.total_cmp(&b.chance)));
+    }
+    // The materials' order carries no meaning; their bands' does.
+    c.quality_tiers.sort_by(|a, b| a.key.cmp(&b.key));
     c
 }
 
@@ -105,6 +136,8 @@ pub struct Stats {
     pub missions: usize,
     #[serde(default)]
     pub locations: usize,
+    #[serde(default)]
+    pub blueprints: usize,
     pub warnings: usize,
 }
 
@@ -128,6 +161,79 @@ impl Report {
 /// the stricter `media::safe_name`, which also refuses `:`.
 pub fn safe_class_name(s: &str) -> bool {
     !s.is_empty() && s.len() <= 200 && !s.contains("..") && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
+}
+
+/// Is `name` a blueprint record name (`BP_CRAFT_behr_rifle_ballistic_01`): 1 to 120 of
+/// `A-Z a-z 0-9 _ . -`? The one rule for blueprint names: the validator applies it to every
+/// dataset, the server to the names its routes take and to a visitor's hand-over.
+pub fn valid_blueprint_name(name: &str) -> bool {
+    (1..=120).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+}
+
+/// Longest `itemType`, `itemSubType` or `itemClass` of a blueprint.
+pub const MAX_BLUEPRINT_LABEL: usize = 64;
+/// Most `tags` of one blueprint.
+pub const MAX_BLUEPRINT_TAGS: usize = 6;
+/// Longest blueprint tag.
+pub const MAX_BLUEPRINT_TAG: usize = 40;
+/// Longest manufacturer code (`ACOM`).
+pub const MAX_MANUFACTURER_CODE: usize = 16;
+/// Longest manufacturer name (`Amon & Reese Co.`).
+pub const MAX_MANUFACTURER_NAME: usize = 80;
+/// Largest item size (the game's go to 12).
+pub const MAX_ITEM_SIZE: u32 = 12;
+/// Largest item grade (the game's are 1 to 4, A to D).
+pub const MAX_ITEM_GRADE: u32 = 9;
+
+/// 1 to `max` characters, none of them a control character: what a blueprint's item type,
+/// sub type, class and manufacturer fields may hold. The extractor leaves out what fails it.
+pub fn valid_blueprint_label(s: &str, max: usize) -> bool {
+    (1..=max).contains(&s.chars().count()) && !s.chars().any(char::is_control)
+}
+
+/// What the key and the name of a material's quality tiers may hold: 1 to
+/// [`MAX_QUALITY_TIER_TEXT`] characters, none of them a control character. The extractor leaves
+/// out what fails it.
+pub fn valid_quality_tier_text(s: &str) -> bool {
+    valid_blueprint_label(s, MAX_QUALITY_TIER_TEXT)
+}
+
+/// The bands of a material's quality tiers: 1 to [`MAX_QUALITY_BANDS`] of them, every `start`,
+/// `end` and `value` inside 0..=[`MAX_QUALITY`] with `start <= end`, in ascending order without
+/// overlapping. The extractor leaves out a material whose bands fail it.
+pub fn valid_quality_bands(bands: &[QualityBand]) -> bool {
+    (1..=MAX_QUALITY_BANDS).contains(&bands.len())
+        && bands.iter().all(|b| [b.start, b.end, b.value].iter().all(|v| (0..=MAX_QUALITY).contains(v)) && b.start <= b.end)
+        && bands.windows(2).all(|w| w[0].end < w[1].start)
+}
+
+/// A blueprint tag (a folder of the record's path): 1 to [`MAX_BLUEPRINT_TAG`] of
+/// `a-z 0-9 _ -`. The extractor leaves out what fails it.
+pub fn valid_blueprint_tag(tag: &str) -> bool {
+    (1..=MAX_BLUEPRINT_TAG).contains(&tag.len()) && tag.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-'))
+}
+
+/// `io::Write` that only counts the bytes and fails once they pass `max`, so measuring a
+/// hostile list stops there instead of holding all of it.
+struct SizeLimit {
+    written: usize,
+    max: usize,
+}
+
+impl std::io::Write for SizeLimit {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.written = self.written.saturating_add(buf.len());
+        if self.written > self.max { Err(std::io::Error::other("too big")) } else { Ok(buf.len()) }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Does `value` serialize to JSON within `max` bytes?
+fn json_fits(value: &impl Serialize, max: usize) -> bool {
+    serde_json::to_writer(SizeLimit { written: 0, max }, value).is_ok()
 }
 
 fn id_ok(s: &str) -> bool {
@@ -159,6 +265,11 @@ fn text_problem(s: &str, max: usize) -> Option<String> {
         return Some(format!("texto com {n} caracteres (máximo {max})"));
     }
     None
+}
+
+/// At most [`MAX_SHORT`] characters of `s`, so a report never repeats a huge hostile string.
+fn short(s: &str) -> String {
+    s.chars().take(MAX_SHORT).collect()
 }
 
 struct Checker<'a> {
@@ -212,6 +323,143 @@ impl Checker<'_> {
             }
         }
     }
+
+    /// Finite and within ±[`MAX_BLUEPRINT_VALUE`].
+    fn value_ok(v: f64) -> bool {
+        v.is_finite() && v.abs() <= MAX_BLUEPRINT_VALUE
+    }
+
+    fn blueprint(&mut self, bp: &Blueprint) {
+        let where_ = format!("blueprint {}", short(&bp.name));
+        // The record name is what the pin and acquired routes take in their URLs.
+        if !valid_blueprint_name(&bp.name) {
+            self.err(format!("{where_}: nome de registro inválido"));
+        }
+        for s in [&bp.display_name, &bp.category].into_iter().flatten() {
+            self.text(&where_, s, MAX_SHORT);
+        }
+        if !safe_class_name(&bp.output_class_name) {
+            self.err(format!("{where_}: classe de saída inválida"));
+        }
+        self.text(&format!("{where_} saída"), &bp.output_name, MAX_SHORT);
+        self.item_ref(&where_, &bp.output_item_id, true);
+        for (what, s) in [("tipo de item", &bp.item_type), ("subtipo de item", &bp.item_sub_type), ("classe de item", &bp.item_class)] {
+            if s.as_deref().is_some_and(|s| !valid_blueprint_label(s, MAX_BLUEPRINT_LABEL)) {
+                self.err(format!("{where_}: {what} inválido"));
+            }
+        }
+        if bp.size.is_some_and(|n| n > MAX_ITEM_SIZE) {
+            self.err(format!("{where_}: tamanho fora de 0..{MAX_ITEM_SIZE}"));
+        }
+        if bp.grade.is_some_and(|n| !(1..=MAX_ITEM_GRADE).contains(&n)) {
+            self.err(format!("{where_}: grau fora de 1..{MAX_ITEM_GRADE}"));
+        }
+        if let Some(m) = &bp.manufacturer
+            && (!valid_blueprint_label(&m.code, MAX_MANUFACTURER_CODE) || !valid_blueprint_label(&m.name, MAX_MANUFACTURER_NAME))
+        {
+            self.err(format!("{where_}: fabricante inválido"));
+        }
+        if bp.tags.len() > MAX_BLUEPRINT_TAGS || bp.tags.iter().any(|t| !valid_blueprint_tag(t)) {
+            self.err(format!("{where_}: tags inválidas"));
+        }
+        if !bp.craft_time_sec.is_finite() || !(0.0..=MAX_CRAFT_TIME_SEC).contains(&bp.craft_time_sec) {
+            self.err(format!("{where_}: tempo inválido"));
+        }
+        if bp.slots.len() > MAX_BLUEPRINT_PARTS || bp.optional_slots.len() > MAX_BLUEPRINT_PARTS {
+            self.err(format!("{where_}: slots demais"));
+            return;
+        }
+        if bp.slots_required.is_some_and(|n| n == 0 || n as usize > bp.slots.len()) {
+            self.warn(format!("{where_} pede {:?} de {} slots", bp.slots_required, bp.slots.len()));
+        }
+        for (i, slot) in bp.slots.iter().enumerate() {
+            self.blueprint_slot(&format!("{where_} slot #{i}"), slot);
+        }
+        for (i, slot) in bp.optional_slots.iter().enumerate() {
+            self.blueprint_slot(&format!("{where_} slot opcional #{i}"), slot);
+        }
+        if bp.sources.len() > MAX_SOURCES_PER_BLUEPRINT {
+            self.err(format!("{where_}: origens demais ({})", bp.sources.len()));
+            return;
+        }
+        for (i, src) in bp.sources.iter().enumerate() {
+            let at = format!("{where_} origem #{i}");
+            if src.kind != "contract" {
+                self.warn(format!("{at} com kind desconhecido: {:?}", short(&src.kind)));
+            }
+            self.text(&at, &src.kind, MAX_SHORT);
+            if !id_ok(&src.contract_id) {
+                self.err(format!("{at}: contrato com id inválido"));
+            }
+            self.text(&at, &src.title, MAX_SHORT);
+            if let Some(g) = &src.giver {
+                self.text(&at, g, MAX_SHORT);
+            }
+            if !matches!(src.when.as_str(), "accept" | "complete") {
+                self.err(format!("{at}: momento inválido"));
+            }
+            self.text(&at, &src.pool, MAX_SHORT);
+            if !src.chance.is_finite() || !(0.0..=1.0).contains(&src.chance) {
+                self.err(format!("{at}: chance fora de 0..1"));
+            }
+            if src.pool_chance.is_some_and(|c| !c.is_finite() || !(0.0..=1.0).contains(&c)) {
+                self.err(format!("{at}: chance do pool fora de 0..1"));
+            }
+        }
+    }
+
+    fn blueprint_slot(&mut self, where_: &str, slot: &BlueprintSlot) {
+        self.text(&format!("{where_} nome"), &slot.name, MAX_SHORT);
+        if slot.options.len() > MAX_BLUEPRINT_PARTS || slot.quality_effects.len() > MAX_BLUEPRINT_PARTS || slot.quantity_multipliers.len() > MAX_BLUEPRINT_PARTS {
+            self.err(format!("{where_}: partes demais"));
+            return;
+        }
+        if slot.count == 0 || slot.count as usize > slot.options.len() {
+            self.warn(format!("{where_} pede {} de {} opções", slot.count, slot.options.len()));
+        }
+        for inp in &slot.options {
+            self.text(&format!("{where_} ingrediente"), &inp.name, MAX_SHORT);
+            if let Some(c) = &inp.class_name {
+                self.text(&format!("{where_} ingrediente"), c, MAX_SHORT);
+            }
+            // The page and the overlay only know these two.
+            if !matches!(inp.kind.as_str(), "resource" | "item") {
+                self.err(format!("{where_}: ingrediente com kind desconhecido: {:?}", short(&inp.kind)));
+            }
+            if !Self::value_ok(inp.qty) || inp.qty < 0.0 || !(0..=MAX_QUALITY).contains(&inp.min_quality) {
+                self.err(format!("{where_}: ingrediente {} com quantidade ou qualidade inválida", short(&inp.name)));
+            }
+            self.item_ref(&format!("{where_} ingrediente"), &inp.item_id, true);
+        }
+        for m in &slot.quantity_multipliers {
+            if m.option.is_some_and(|o| o as usize >= slot.options.len()) || !Self::value_ok(m.multiplier) || m.multiplier < 0.0 {
+                self.err(format!("{where_}: multiplicador inválido"));
+            }
+        }
+        for e in &slot.quality_effects {
+            let key = short(&e.key);
+            if !safe_class_name(&e.key) {
+                self.err(format!("{where_}: efeito de qualidade com chave inválida: {key:?}"));
+            }
+            if let Some(n) = &e.name {
+                self.text(&format!("{where_} efeito"), n, MAX_SHORT);
+            }
+            if e.ranges.len() > MAX_QUALITY_RANGES {
+                self.err(format!("{where_}: efeito {key} com faixas demais"));
+                continue;
+            }
+            if e.ranges.is_empty() {
+                self.warn(format!("{where_}: efeito {key} sem faixas"));
+            }
+            for r in &e.ranges {
+                if !(0..=MAX_QUALITY).contains(&r.start_quality) || !(0..=MAX_QUALITY).contains(&r.end_quality) || !Self::value_ok(r.at_start) || !Self::value_ok(r.at_end) {
+                    self.err(format!("{where_}: efeito {key} com faixa inválida"));
+                } else if r.start_quality > r.end_quality {
+                    self.warn(format!("{where_}: efeito {key} com faixa invertida"));
+                }
+            }
+        }
+    }
 }
 
 /// Check a dataset before installing it; `previous` is the dataset currently active for
@@ -235,8 +483,10 @@ pub fn validate_dataset(ds: &WikeloDataset, previous: Option<&WikeloDataset>) ->
     if !version_ok(&ds.build.version) {
         ck.err(format!("versão inválida: {:?}", ds.build.version));
     }
-    if !ds.build.p4_change.is_empty() && !ds.build.p4_change.chars().all(|c| c.is_ascii_digit()) {
-        ck.err(format!("p4Change inválido: {:?}", ds.build.p4_change));
+    // Empty or a change number `build_order` takes (1 to 18 digits): anything else would sort
+    // as no number at all and could not say which build is newer.
+    if !ds.build.p4_change.is_empty() && p4_change_number(&ds.build.p4_change).is_none() {
+        ck.err(format!("p4Change inválido: {:?}", short(&ds.build.p4_change)));
     }
     for (what, s) in [("branch", &ds.build.branch), ("buildId", &ds.build.build_id), ("tag", &ds.build.tag), ("generatedAt", &ds.generated_at), ("source", &ds.source)] {
         if s.len() > 80 || text_problem(s, 80).is_some() {
@@ -268,6 +518,9 @@ pub fn validate_dataset(ds: &WikeloDataset, previous: Option<&WikeloDataset>) ->
         ("loot de missão", ds.mission_drops.len(), MAX_MISSION_DROPS),
         ("missões", ds.missions.len(), MAX_MISSIONS),
         ("locais", ds.locations.len(), MAX_LOCATIONS),
+        ("blueprints", ds.blueprints.len(), MAX_BLUEPRINTS),
+        ("origens de blueprint", ds.blueprints.iter().map(|b| b.sources.len()).sum::<usize>(), MAX_BLUEPRINT_SOURCES),
+        ("materiais com faixas de qualidade", ds.quality_tiers.len(), MAX_QUALITY_TIERS),
         ("avisos", ds.warnings.len(), MAX_WARNINGS),
     ] {
         if n > max {
@@ -484,6 +737,37 @@ pub fn validate_dataset(ds: &WikeloDataset, previous: Option<&WikeloDataset>) ->
             }
         }
     }
+    // `GET …/blueprints` sends them all in one answer. Checked before each blueprint, so the
+    // report (which keeps a limited number of errors) always says it.
+    if !ds.blueprints.is_empty() && !json_fits(&ds.blueprints, MAX_BLUEPRINTS_BYTES) {
+        ck.err(format!("blueprints: mais de {} MB no total", MAX_BLUEPRINTS_BYTES / (1024 * 1024)));
+    }
+    let mut seen = HashSet::new();
+    let mut seen_name = HashSet::new();
+    for bp in ds.blueprints.iter().take(MAX_BLUEPRINTS) {
+        if !id_ok(&bp.id) || !seen.insert(bp.id.as_str()) {
+            ck.err(format!("blueprint com id inválido ou repetido: {:?}", short(&bp.id)));
+        }
+        // Pins and acquired marks name a blueprint by its record name, so it must be unique.
+        if !seen_name.insert(bp.name.as_str()) {
+            ck.err(format!("blueprint com nome repetido: {:?}", short(&bp.name)));
+        }
+        ck.blueprint(bp);
+    }
+    // Quality tiers: the Blueprints page's craft simulator looks a slot's material up by name.
+    let mut seen = HashSet::new();
+    for t in ds.quality_tiers.iter().take(MAX_QUALITY_TIERS) {
+        let key = short(&t.key);
+        if !valid_quality_tier_text(&t.key) || !seen.insert(t.key.as_str()) {
+            ck.err(format!("faixas de qualidade com chave inválida ou repetida: {key:?}"));
+        }
+        if !valid_quality_tier_text(&t.name) {
+            ck.err(format!("faixas de qualidade {key:?}: nome inválido"));
+        }
+        if !valid_quality_bands(&t.bands) {
+            ck.err(format!("faixas de qualidade {key:?}: faixas inválidas"));
+        }
+    }
     let mut seen = HashSet::new();
     for m in &ds.mission_rewards {
         if !id_ok(&m.contract_id) || !id_ok(&m.item_id) {
@@ -572,10 +856,30 @@ pub fn validate_dataset(ds: &WikeloDataset, previous: Option<&WikeloDataset>) ->
     // Against what is active now.
     if let Some(prev) = previous {
         let (vn, vp) = (version_key(&ds.build.version), version_key(&prev.build.version));
-        if vn < vp {
-            ck.warn(format!("versão {} é mais antiga que a ativa ({})", ds.build.version, prev.build.version));
+        // The server's own rule (`build_order`): an older build is kept but never used.
+        if build_order(&ds.build) < build_order(&prev.build) {
+            ck.warn(format!(
+                "versão {} (p4Change {}) é mais antiga que a ativa ({}, p4Change {}): fica guardada sem trocar a ativa",
+                ds.build.version,
+                short(&ds.build.p4_change),
+                prev.build.version,
+                short(&prev.build.p4_change)
+            ));
         } else if vn == vp && canonical_hash(ds) != canonical_hash(prev) {
             ck.warn(format!("mesma versão da ativa ({}) com conteúdo diferente", prev.build.version));
+        }
+        // The change number decides; when it and the version disagree, one of them is wrong.
+        if let (Some(pn), Some(pp)) = (p4_change_number(&ds.build.p4_change), p4_change_number(&prev.build.p4_change))
+            && ((pn > pp && vn < vp) || (pn < pp && vn > vp))
+        {
+            let (p4_says, version_says) = if pn > pp { ("mais novo", "mais antiga") } else { ("mais antigo", "mais nova") };
+            ck.warn(format!(
+                "p4Change {pn} é {p4_says} que o da ativa ({pp}), mas a versão {} é {version_says} que a ativa ({}); vale o p4Change",
+                ds.build.version, prev.build.version
+            ));
+        }
+        if !prev.blueprints.is_empty() && ds.blueprints.is_empty() {
+            ck.warn(format!("nenhuma blueprint, e a ativa tem {}", prev.blueprints.len()));
         }
         let new_ids: HashSet<&str> = ds.contracts.iter().map(|c| c.id.as_str()).collect();
         let removed: Vec<&Contract> = prev.contracts.iter().filter(|c| !new_ids.contains(c.id.as_str())).collect();
@@ -604,6 +908,7 @@ pub fn validate_dataset(ds: &WikeloDataset, previous: Option<&WikeloDataset>) ->
         mission_drops: ds.mission_drops.len(),
         missions: ds.missions.len(),
         locations: ds.locations.len(),
+        blueprints: ds.blueprints.len(),
         warnings: ds.warnings.len(),
     };
     ck.report
@@ -663,6 +968,8 @@ mod tests {
             mission_drops: vec![],
             missions: vec![],
             locations: vec![location("Stanton2_Orison", "Orison"), location("RR_CRU_LEO", "Seraphim Station")],
+            blueprints: vec![],
+            quality_tiers: vec![],
             extractor: Some(ExtractorInfo { name: "wikelo-watcher".into(), version: "0.1.0".into(), commit: "dev".into(), dcb_sha256: "a".into(), ini_sha256: "b".into(), revision: 0 }),
         }
     }
@@ -694,6 +1001,19 @@ mod tests {
         let mut e = sample();
         e.locations[0].name = "Orison City".into();
         assert_ne!(canonical_hash(&a), canonical_hash(&e));
+
+        // Quality tiers are in the hash; the materials' order is not.
+        let t = with_tiers();
+        assert_ne!(canonical_hash(&a), canonical_hash(&t), "the field is in the hash");
+        let mut u = with_tiers();
+        u.quality_tiers.reverse();
+        assert_eq!(canonical_hash(&t), canonical_hash(&u), "the materials' order carries no meaning");
+        let mut v = with_tiers();
+        v.quality_tiers[0].bands[0].value += 1;
+        assert_ne!(canonical_hash(&t), canonical_hash(&v), "a changed band value");
+        let mut w = with_tiers();
+        w.quality_tiers[1].name = "Jumping Lime".into();
+        assert_ne!(canonical_hash(&t), canonical_hash(&w), "a changed name");
     }
 
     #[test]
@@ -704,6 +1024,303 @@ mod tests {
         ds.locations.clear();
         let json = serde_json::to_string(&canonicalize(&ds)).unwrap();
         assert!(!json.contains("locations"), "{json}");
+        // Same for the quality tiers.
+        assert!(!json.contains("qualityTiers"), "{json}");
+    }
+
+    /// The bands every material has today, with Agricium's values.
+    fn bands() -> Vec<QualityBand> {
+        [(0, 399, 346), (400, 599, 588), (600, 699, 667), (700, 799, 796), (800, 899, 852), (900, 949, 943), (950, 998, 971), (999, 1000, 1000)]
+            .into_iter()
+            .map(|(start, end, value)| QualityBand { start, end, value })
+            .collect()
+    }
+
+    fn with_tiers() -> WikeloDataset {
+        let mut ds = sample();
+        ds.quality_tiers = vec![
+            QualityTiers { key: "Agricium".into(), name: "Agricium".into(), bands: bands() },
+            QualityTiers { key: "JumpingLimes".into(), name: "Jumping Limes".into(), bands: bands() },
+        ];
+        ds
+    }
+
+    #[test]
+    fn valid_quality_tiers_pass() {
+        let r = validate_dataset(&with_tiers(), None);
+        assert!(r.ok(), "{:?}", r.errors);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        // The bounds themselves pass.
+        let mut ds = with_tiers();
+        ds.quality_tiers[0].key = "K".repeat(MAX_QUALITY_TIER_TEXT);
+        ds.quality_tiers[0].name = "é".repeat(MAX_QUALITY_TIER_TEXT);
+        ds.quality_tiers[1].bands = (0..MAX_QUALITY_BANDS as i64).map(|n| QualityBand { start: n * 10, end: n * 10 + 9, value: n * 10 }).collect();
+        let r = validate_dataset(&ds, None);
+        assert!(r.ok(), "{:?}", r.errors);
+        let mut ds = with_tiers();
+        ds.quality_tiers[0].bands = vec![QualityBand { start: 0, end: 0, value: 0 }, QualityBand { start: 1, end: MAX_QUALITY, value: MAX_QUALITY }];
+        assert!(validate_dataset(&ds, None).ok(), "a one-point band, and the scale's edges");
+        let mut ds = sample();
+        ds.quality_tiers = (0..MAX_QUALITY_TIERS).map(|n| QualityTiers { key: format!("M{n}"), name: format!("M {n}"), bands: bands() }).collect();
+        assert!(validate_dataset(&ds, None).ok(), "{MAX_QUALITY_TIERS} materials");
+    }
+
+    #[test]
+    fn bad_quality_tiers_are_errors() {
+        let rejects = |what: &str, change: &dyn Fn(&mut QualityTiers)| {
+            let mut ds = with_tiers();
+            change(&mut ds.quality_tiers[0]);
+            let r = validate_dataset(&ds, None);
+            assert!(r.errors.iter().any(|e| e.starts_with("faixas de qualidade")), "{what} should be refused: {:?}", r.errors);
+            assert!(r.errors.iter().all(|e| e.chars().count() < 600), "{what}: errors stay short: {:?}", r.errors);
+        };
+        rejects("duplicate key", &|t| t.key = "JumpingLimes".into());
+        rejects("empty key", &|t| t.key = String::new());
+        rejects("long key", &|t| t.key = "K".repeat(MAX_QUALITY_TIER_TEXT + 1));
+        rejects("huge key", &|t| t.key = "K".repeat(100_000));
+        rejects("key with a control character", &|t| t.key = "Agri\u{0}cium".into());
+        rejects("empty name", &|t| t.name = String::new());
+        rejects("long name", &|t| t.name = "é".repeat(MAX_QUALITY_TIER_TEXT + 1));
+        rejects("name with a newline", &|t| t.name = "Agri\ncium".into());
+        rejects("no bands", &|t| t.bands.clear());
+        rejects("too many bands", &|t| t.bands = (0..=MAX_QUALITY_BANDS as i64).map(|n| QualityBand { start: n * 10, end: n * 10 + 9, value: n * 10 }).collect());
+        rejects("negative start", &|t| t.bands[0].start = -1);
+        rejects("end above the scale", &|t| t.bands[7].end = MAX_QUALITY + 1);
+        rejects("start above the scale", &|t| t.bands = vec![QualityBand { start: MAX_QUALITY + 1, end: MAX_QUALITY + 2, value: 1 }]);
+        rejects("negative value", &|t| t.bands[0].value = -1);
+        rejects("value above the scale", &|t| t.bands[7].value = MAX_QUALITY + 1);
+        rejects("start after end", &|t| t.bands[0] = QualityBand { start: 399, end: 0, value: 346 });
+        rejects("overlapping bands", &|t| t.bands[1].start = 399);
+        rejects("bands out of order", &|t| t.bands.swap(0, 1));
+
+        let mut ds = sample();
+        ds.quality_tiers = (0..=MAX_QUALITY_TIERS).map(|n| QualityTiers { key: format!("M{n}"), name: format!("M {n}"), bands: bands() }).collect();
+        assert!(validate_dataset(&ds, None).errors.iter().any(|e| e.starts_with("materiais com faixas de qualidade")), "too many materials");
+    }
+
+    fn source(contract_id: &str, chance: f64) -> BlueprintSource {
+        BlueprintSource {
+            kind: "contract".into(),
+            contract_id: contract_id.into(),
+            title: "Intro".into(),
+            giver: Some("Wikelo Emporium".into()),
+            when: "complete".into(),
+            pool: "BP_MISSIONREWARD_Intro".into(),
+            chance,
+            pool_chance: None,
+            disabled: false,
+        }
+    }
+
+    fn blueprint(id: &str) -> Blueprint {
+        Blueprint {
+            id: id.into(),
+            name: format!("BP_CRAFT_{id}"),
+            display_name: None,
+            category: Some("FPSWeapons".into()),
+            output_item_id: Some("i2".into()),
+            output_class_name: "MG_Scrip".into(),
+            output_name: "MG Scrip".into(),
+            item_type: Some("WeaponPersonal".into()),
+            item_sub_type: Some("Medium".into()),
+            size: Some(2),
+            grade: Some(1),
+            manufacturer: Some(BlueprintManufacturer { code: "BEHR".into(), name: "Behring".into() }),
+            item_class: Some("Military".into()),
+            tags: vec!["fpsgear".into(), "weapons".into(), "rifle".into()],
+            default: true,
+            craft_time_sec: 150.0,
+            slots_required: Some(1),
+            slots: vec![BlueprintSlot {
+                name: "Frame".into(),
+                count: 1,
+                options: vec![CraftInput { kind: "resource".into(), item_id: Some("i1".into()), class_name: None, name: "Iron".into(), qty: 0.04, unit: Unit::Scu, min_quality: 0 }],
+                quantity_multipliers: vec![QuantityMultiplier { option: Some(0), multiplier: 1.15 }],
+                quality_effects: vec![QualityEffect {
+                    key: "gpp_weapon_damage".into(),
+                    name: Some("Damage".into()),
+                    ranges: vec![QualityRange { kind: QualityRangeKind::Linear, start_quality: 0, end_quality: 1000, at_start: 0.925, at_end: 1.075 }],
+                }],
+            }],
+            optional_slots: vec![],
+            sources: vec![source("c1", 0.25), source("c2", 0.5)],
+        }
+    }
+
+    fn with_blueprints() -> WikeloDataset {
+        let mut ds = sample();
+        ds.blueprints = vec![blueprint("b1"), blueprint("b2")];
+        ds
+    }
+
+    #[test]
+    fn hash_covers_blueprints_but_not_their_order() {
+        let a = with_blueprints();
+        assert_ne!(canonical_hash(&a), canonical_hash(&sample()), "the field is in the hash");
+        let mut b = with_blueprints();
+        b.blueprints.reverse();
+        b.blueprints[0].sources.reverse();
+        assert_eq!(canonical_hash(&a), canonical_hash(&b), "list order carries no meaning");
+        let mut c = with_blueprints();
+        c.blueprints[1].slots[0].quality_effects[0].ranges[0].at_end = 1.1;
+        assert_ne!(canonical_hash(&a), canonical_hash(&c), "a changed quality range");
+        let mut d = with_blueprints();
+        d.blueprints[0].sources[0].chance = 0.3;
+        assert_ne!(canonical_hash(&a), canonical_hash(&d), "a changed chance");
+        let mut p = with_blueprints();
+        p.blueprints[0].sources[0].pool_chance = Some(0.25);
+        assert_ne!(canonical_hash(&a), canonical_hash(&p), "the pool chance is in the hash");
+        let mut e = with_blueprints();
+        e.blueprints[0].craft_time_sec = 151.0;
+        assert_ne!(canonical_hash(&a), canonical_hash(&e), "a changed craft time");
+        // What the blueprint's item is: every field is in the hash.
+        type Change<'a> = (&'a str, &'a dyn Fn(&mut Blueprint));
+        let changes: [Change; 9] = [
+            ("item type", &|b: &mut Blueprint| b.item_type = Some("WeaponGun".into())),
+            ("sub type", &|b: &mut Blueprint| b.item_sub_type = None),
+            ("size", &|b: &mut Blueprint| b.size = Some(3)),
+            ("grade", &|b: &mut Blueprint| b.grade = Some(2)),
+            ("manufacturer code", &|b: &mut Blueprint| b.manufacturer.as_mut().unwrap().code = "KSAR".into()),
+            ("manufacturer name", &|b: &mut Blueprint| b.manufacturer.as_mut().unwrap().name = "Kastak Arms".into()),
+            ("class", &|b: &mut Blueprint| b.item_class = Some("Civilian".into())),
+            ("tags", &|b: &mut Blueprint| b.tags.push("ballistic".into())),
+            ("default", &|b: &mut Blueprint| b.default = false),
+        ];
+        for (what, change) in changes {
+            let mut f = with_blueprints();
+            change(&mut f.blueprints[0]);
+            assert_ne!(canonical_hash(&a), canonical_hash(&f), "a changed {what}");
+        }
+        // A blueprint without them serializes as one did before they existed.
+        let mut bare = with_blueprints();
+        for bp in &mut bare.blueprints {
+            *bp = Blueprint { item_type: None, item_sub_type: None, size: None, grade: None, manufacturer: None, item_class: None, tags: vec![], default: false, ..bp.clone() };
+        }
+        let json = serde_json::to_string(&canonicalize(&bare).blueprints).unwrap();
+        for key in ["itemType", "itemSubType", "\"size\"", "\"grade\"", "manufacturer", "itemClass", "\"tags\"", "\"default\""] {
+            assert!(!json.contains(key), "{key} stays out when unknown: {json}");
+        }
+        // Same for a source without a pool chance (the sample's sources have none).
+        assert!(!json.contains("poolChance"), "poolChance stays out when absent: {json}");
+        // Without blueprints the canonical form is what it was before the field existed.
+        let json = serde_json::to_string(&canonicalize(&sample())).unwrap();
+        assert!(!json.contains("blueprints"), "{json}");
+    }
+
+    #[test]
+    fn valid_blueprints_pass() {
+        let r = validate_dataset(&with_blueprints(), None);
+        assert!(r.ok(), "{:?}", r.errors);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert_eq!(r.stats.blueprints, 2);
+        // A pool chance anywhere from 0 to 1 (both included) is accepted.
+        for c in [0.0, 0.25, 1.0] {
+            let mut ds = with_blueprints();
+            ds.blueprints[0].sources[0].pool_chance = Some(c);
+            let r = validate_dataset(&ds, None);
+            assert!(r.ok(), "pool chance {c}: {:?}", r.errors);
+        }
+    }
+
+    #[test]
+    fn bad_blueprints_are_errors() {
+        let rejects = |what: &str, change: &dyn Fn(&mut Blueprint)| {
+            let mut ds = with_blueprints();
+            change(&mut ds.blueprints[0]);
+            let r = validate_dataset(&ds, None);
+            assert!(!r.ok(), "{what} should be refused");
+            assert!(r.errors.iter().all(|e| e.chars().count() < 600), "{what}: errors stay short: {:?}", r.errors);
+        };
+        rejects("duplicate id", &|b| b.id = "b2".into());
+        rejects("unsafe id", &|b| b.id = "../x".into());
+        rejects("unsafe record name", &|b| b.name = "a b".into());
+        rejects("unsafe output class", &|b| b.output_class_name = "../etc".into());
+        rejects("dangling output item", &|b| b.output_item_id = Some("nope".into()));
+        rejects("control characters", &|b| b.output_name = "a\u{0}b".into());
+        rejects("long category", &|b| b.category = Some("x".repeat(MAX_SHORT + 1)));
+        rejects("infinite time", &|b| b.craft_time_sec = f64::INFINITY);
+        rejects("negative time", &|b| b.craft_time_sec = -1.0);
+        rejects("absurd time", &|b| b.craft_time_sec = MAX_CRAFT_TIME_SEC * 2.0);
+        rejects("too many slots", &|b| b.slots = vec![b.slots[0].clone(); MAX_BLUEPRINT_PARTS + 1]);
+        rejects("too many optional slots", &|b| b.optional_slots = vec![b.slots[0].clone(); MAX_BLUEPRINT_PARTS + 1]);
+        rejects("too many options", &|b| b.slots[0].options = vec![b.slots[0].options[0].clone(); MAX_BLUEPRINT_PARTS + 1]);
+        rejects("too many effects", &|b| b.slots[0].quality_effects = vec![b.slots[0].quality_effects[0].clone(); MAX_BLUEPRINT_PARTS + 1]);
+        rejects("negative quantity", &|b| b.slots[0].options[0].qty = -1.0);
+        rejects("NaN quantity", &|b| b.slots[0].options[0].qty = f64::NAN);
+        rejects("absurd quantity", &|b| b.slots[0].options[0].qty = MAX_BLUEPRINT_VALUE * 2.0);
+        rejects("quality above the scale", &|b| b.slots[0].options[0].min_quality = MAX_QUALITY + 1);
+        rejects("negative quality", &|b| b.slots[0].options[0].min_quality = -1);
+        rejects("dangling ingredient", &|b| b.slots[0].options[0].item_id = Some("nope".into()));
+        rejects("multiplier of a missing option", &|b| b.slots[0].quantity_multipliers[0].option = Some(1));
+        rejects("NaN multiplier", &|b| b.slots[0].quantity_multipliers[0].multiplier = f64::NAN);
+        rejects("unsafe effect key", &|b| b.slots[0].quality_effects[0].key = "x".repeat(10_000));
+        rejects("too many ranges", &|b| {
+            let range = b.slots[0].quality_effects[0].ranges[0].clone();
+            b.slots[0].quality_effects[0].ranges = vec![range; MAX_QUALITY_RANGES + 1];
+        });
+        rejects("range above the scale", &|b| b.slots[0].quality_effects[0].ranges[0].end_quality = MAX_QUALITY + 1);
+        rejects("negative range start", &|b| b.slots[0].quality_effects[0].ranges[0].start_quality = -1);
+        rejects("infinite modifier", &|b| b.slots[0].quality_effects[0].ranges[0].at_start = f64::INFINITY);
+        rejects("absurd modifier", &|b| b.slots[0].quality_effects[0].ranges[0].at_end = -MAX_BLUEPRINT_VALUE * 2.0);
+        rejects("chance above one", &|b| b.sources[0].chance = 1.5);
+        rejects("negative chance", &|b| b.sources[0].chance = -0.1);
+        rejects("NaN chance", &|b| b.sources[0].chance = f64::NAN);
+        rejects("pool chance above one", &|b| b.sources[0].pool_chance = Some(1.01));
+        rejects("negative pool chance", &|b| b.sources[0].pool_chance = Some(-0.1));
+        rejects("NaN pool chance", &|b| b.sources[0].pool_chance = Some(f64::NAN));
+        rejects("infinite pool chance", &|b| b.sources[0].pool_chance = Some(f64::INFINITY));
+        rejects("unknown moment", &|b| b.sources[0].when = "later".into());
+        rejects("bad contract id", &|b| b.sources[0].contract_id = String::new());
+        rejects("long title", &|b| b.sources[0].title = "x".repeat(MAX_SHORT + 1));
+        rejects("too many sources of one blueprint", &|b| b.sources = vec![source("c1", 0.1); MAX_SOURCES_PER_BLUEPRINT + 1]);
+        rejects("empty item type", &|b| b.item_type = Some(String::new()));
+        rejects("long item type", &|b| b.item_type = Some("x".repeat(MAX_BLUEPRINT_LABEL + 1)));
+        rejects("item type with a newline", &|b| b.item_type = Some("Weapon\nGun".into()));
+        rejects("long sub type", &|b| b.item_sub_type = Some("x".repeat(MAX_BLUEPRINT_LABEL + 1)));
+        rejects("sub type with a control character", &|b| b.item_sub_type = Some("a\u{7}".into()));
+        rejects("empty class", &|b| b.item_class = Some(String::new()));
+        rejects("long class", &|b| b.item_class = Some("é".repeat(MAX_BLUEPRINT_LABEL + 1)));
+        rejects("size above 12", &|b| b.size = Some(MAX_ITEM_SIZE + 1));
+        rejects("grade 0", &|b| b.grade = Some(0));
+        rejects("grade above 9", &|b| b.grade = Some(MAX_ITEM_GRADE + 1));
+        rejects("empty manufacturer code", &|b| b.manufacturer = Some(BlueprintManufacturer { code: String::new(), name: "Behring".into() }));
+        rejects("long manufacturer code", &|b| b.manufacturer = Some(BlueprintManufacturer { code: "X".repeat(MAX_MANUFACTURER_CODE + 1), name: "Behring".into() }));
+        rejects("empty manufacturer name", &|b| b.manufacturer = Some(BlueprintManufacturer { code: "BEHR".into(), name: String::new() }));
+        rejects("long manufacturer name", &|b| b.manufacturer = Some(BlueprintManufacturer { code: "BEHR".into(), name: "x".repeat(MAX_MANUFACTURER_NAME + 1) }));
+        rejects("manufacturer name with a tab", &|b| b.manufacturer = Some(BlueprintManufacturer { code: "BEHR".into(), name: "Beh\tring".into() }));
+        rejects("too many tags", &|b| b.tags = vec!["a".into(); MAX_BLUEPRINT_TAGS + 1]);
+        rejects("empty tag", &|b| b.tags = vec![String::new()]);
+        rejects("long tag", &|b| b.tags = vec!["a".repeat(MAX_BLUEPRINT_TAG + 1)]);
+        rejects("upper-case tag", &|b| b.tags = vec!["FPSGear".into()]);
+        rejects("tag with a separator", &|b| b.tags = vec!["fpsgear/weapons".into()]);
+        rejects("tag with a space", &|b| b.tags = vec!["fps gear".into()]);
+
+        let mut ds = sample();
+        ds.blueprints = (0..=MAX_BLUEPRINTS).map(|n| blueprint(&format!("b{n}"))).collect();
+        assert!(validate_dataset(&ds, None).errors.iter().any(|e| e.starts_with("blueprints:")), "too many blueprints");
+        let mut ds = with_blueprints();
+        let many = vec![source("c1", 0.1); MAX_SOURCES_PER_BLUEPRINT];
+        ds.blueprints = (0..MAX_BLUEPRINT_SOURCES / MAX_SOURCES_PER_BLUEPRINT + 1).map(|n| Blueprint { sources: many.clone(), ..blueprint(&format!("b{n}")) }).collect();
+        assert!(validate_dataset(&ds, None).errors.iter().any(|e| e.starts_with("origens de blueprint")), "too many sources overall");
+    }
+
+    #[test]
+    fn odd_blueprints_are_warnings() {
+        let warns = |what: &str, change: &dyn Fn(&mut Blueprint)| {
+            let mut ds = with_blueprints();
+            change(&mut ds.blueprints[0]);
+            let r = validate_dataset(&ds, None);
+            assert!(r.ok(), "{what}: {:?}", r.errors);
+            assert!(!r.warnings.is_empty(), "{what} should warn");
+        };
+        warns("a slot asking for nothing", &|b| b.slots[0].count = 0);
+        warns("more slots required than listed", &|b| b.slots_required = Some(2));
+        warns("an inverted range", &|b| {
+            let r = &mut b.slots[0].quality_effects[0].ranges[0];
+            r.start_quality = 900;
+            r.end_quality = 100;
+        });
+        warns("an unknown source kind", &|b| b.sources[0].kind = "shop".into());
     }
 
     #[test]
@@ -806,5 +1423,96 @@ mod tests {
         assert!(r.warnings.iter().any(|w| w.contains("mais antiga")), "{:?}", r.warnings);
         assert!(r.warnings.iter().any(|w| w.contains("mudança grande")), "{:?}", r.warnings);
         assert!(validate_dataset(&sample(), Some(&active)).warnings.is_empty());
+    }
+
+    #[test]
+    fn p4_change_must_be_a_change_number() {
+        for bad in ["9".repeat(20), "12a4".to_string(), "-1".to_string(), " 1".to_string()] {
+            let mut ds = sample();
+            ds.build.p4_change = bad.clone();
+            assert!(validate_dataset(&ds, None).errors.iter().any(|e| e.starts_with("p4Change inválido")), "{bad:?}");
+        }
+        let longest = "9".repeat(18);
+        for good in ["", "1", "12913470", longest.as_str()] {
+            let mut ds = sample();
+            ds.build.p4_change = good.to_string();
+            assert!(validate_dataset(&ds, None).ok(), "{good:?}");
+        }
+    }
+
+    #[test]
+    fn p4_change_and_version_disagreeing_is_a_warning() {
+        let active = sample(); // 4.10.197.2878, p4Change 12913470
+        let disagree = |r: &Report| r.warnings.iter().any(|w| w.contains("vale o p4Change"));
+        // A newer change number with an older version: the change number decides (newer).
+        let mut ds = sample();
+        ds.build.p4_change = "12913471".into();
+        ds.build.version = "4.9.0.1".into();
+        let r = validate_dataset(&ds, Some(&active));
+        assert!(r.ok() && disagree(&r), "{:?}", r.warnings);
+        assert!(!r.warnings.iter().any(|w| w.contains("fica guardada")), "not older by the server's rule: {:?}", r.warnings);
+        // The reverse: an older change number with a newer version is older.
+        let mut ds = sample();
+        ds.build.p4_change = "12913469".into();
+        ds.build.version = "4.11.0.1".into();
+        let r = validate_dataset(&ds, Some(&active));
+        assert!(disagree(&r) && r.warnings.iter().any(|w| w.contains("mais antiga")), "{:?}", r.warnings);
+        // Both newer: nothing to say.
+        let mut ds = sample();
+        ds.build.p4_change = "12913471".into();
+        ds.build.version = "4.11.0.1".into();
+        assert!(!disagree(&validate_dataset(&ds, Some(&active))));
+    }
+
+    #[test]
+    fn blueprint_names_are_unique_and_url_safe() {
+        assert!(valid_blueprint_name("BP_CRAFT_behr_rifle_ballistic_01") && valid_blueprint_name(&"a".repeat(120)));
+        for bad in ["", "a b", "BP:x", "../x", "ação"] {
+            assert!(!valid_blueprint_name(bad), "{bad:?}");
+        }
+        assert!(!valid_blueprint_name(&"a".repeat(121)));
+
+        let mut ds = with_blueprints();
+        ds.blueprints[1].name = ds.blueprints[0].name.clone();
+        assert!(validate_dataset(&ds, None).errors.iter().any(|e| e.contains("nome repetido")), "duplicate name");
+        let long = "B".repeat(121);
+        for bad in ["BP:CRAFT", long.as_str()] {
+            let mut ds = with_blueprints();
+            ds.blueprints[0].name = bad.to_string();
+            assert!(validate_dataset(&ds, None).errors.iter().any(|e| e.contains("nome de registro inválido")), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn blueprint_ingredient_kind_is_bounded() {
+        let mut ds = with_blueprints();
+        ds.blueprints[0].slots[0].options[0].kind = "item".into();
+        assert!(validate_dataset(&ds, None).ok());
+        ds.blueprints[0].slots[0].options[0].kind = "ship".into();
+        assert!(validate_dataset(&ds, None).errors.iter().any(|e| e.contains("kind desconhecido")));
+        let mut ds = with_blueprints();
+        ds.blueprints[0].optional_slots = vec![ds.blueprints[0].slots[0].clone()];
+        ds.blueprints[0].optional_slots[0].options[0].kind = "x".repeat(10_000);
+        let r = validate_dataset(&ds, None);
+        assert!(!r.ok() && r.errors.iter().all(|e| e.chars().count() < 600), "{:?}", r.errors.len());
+    }
+
+    #[test]
+    fn blueprints_are_bounded_in_total_size() {
+        let mut ds = with_blueprints();
+        // About 18 MB of sources on one blueprint.
+        let big = BlueprintSource { pool: "p".repeat(4000), ..source("c1", 0.1) };
+        ds.blueprints[0].sources = vec![big; 4500];
+        assert!(validate_dataset(&ds, None).errors.iter().any(|e| e.contains("MB no total")));
+        assert!(!validate_dataset(&with_blueprints(), None).errors.iter().any(|e| e.contains("MB no total")));
+    }
+
+    #[test]
+    fn losing_every_blueprint_is_a_warning() {
+        let active = with_blueprints();
+        let r = validate_dataset(&sample(), Some(&active));
+        assert!(r.ok() && r.warnings.iter().any(|w| w.contains("nenhuma blueprint")), "{:?}", r.warnings);
+        assert!(!validate_dataset(&with_blueprints(), Some(&active)).warnings.iter().any(|w| w.contains("nenhuma blueprint")));
+        assert!(!validate_dataset(&sample(), Some(&sample())).warnings.iter().any(|w| w.contains("nenhuma blueprint")));
     }
 }

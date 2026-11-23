@@ -90,12 +90,19 @@ pub struct Normalizer<'r, 'db, 'a> {
     resource_names: HashMap<String, String>,
     /// Resource record id -> the quality values it can have (see [`Item::qualities`]).
     resource_qualities: HashMap<String, Vec<i64>>,
+    /// Quality table (`CraftingQualityQuantizationRecord`) id -> every resource whose
+    /// `qualityQuantization` property points at it, with the refined resource it turns into.
+    quantization_users: HashMap<String, Vec<(String, Option<String>)>>,
+    /// Resource record name without `ResourceType.`, in lower case -> the resource's id.
+    resource_ids_by_record: HashMap<String, String>,
     items: BTreeMap<String, Item>,
     emporiums: Vec<EmporiumInfo>,
     scope_ids: HashSet<String>,
     warnings: Vec<String>,
     /// Blueprint record id -> (contract id, granted on accept, chance).
     blueprint_sources: HashMap<String, Vec<(String, bool, f64)>>,
+    /// Gameplay property record id -> its English name (see [`localized_name`]).
+    property_names: HashMap<String, Option<String>>,
 }
 
 impl<'r, 'db, 'a> Normalizer<'r, 'db, 'a> {
@@ -106,11 +113,14 @@ impl<'r, 'db, 'a> Normalizer<'r, 'db, 'a> {
             tag_names: HashMap::new(),
             resource_names: HashMap::new(),
             resource_qualities: HashMap::new(),
+            quantization_users: HashMap::new(),
+            resource_ids_by_record: HashMap::new(),
             items: BTreeMap::new(),
             emporiums: Vec::new(),
             scope_ids: HashSet::new(),
             warnings: Vec::new(),
             blueprint_sources: HashMap::new(),
+            property_names: HashMap::new(),
         }
     }
 
@@ -192,6 +202,10 @@ impl<'r, 'db, 'a> Normalizer<'r, 'db, 'a> {
             .collect();
 
         let faction = self.faction();
+        // Last of the item readers: it looks the catalog up without adding to it.
+        let blueprints = self.load_blueprints(&contracts, &faction.name);
+        // After the blueprints: a material is named the way their slots name it.
+        let quality_tiers = self.load_quality_tiers(&blueprints);
         let emporiums: Vec<Emporium> = self.emporiums.iter().map(|e| e.emporium.clone()).collect();
         let mut warnings = std::mem::take(&mut self.warnings);
         warnings.extend(std::mem::take(&mut self.res.warnings));
@@ -213,6 +227,8 @@ impl<'r, 'db, 'a> Normalizer<'r, 'db, 'a> {
             mission_drops: Vec::new(), // filled by `drops` once the contracts and items are known
             missions: Vec::new(),      // filled by `missions` from the rewards and drops above
             locations,
+            blueprints,
+            quality_tiers,
             extractor: None,
         })
     }
@@ -342,15 +358,7 @@ impl<'r, 'db, 'a> Normalizer<'r, 'db, 'a> {
                     self.craft_slots(o, &mut slots);
                 }
             }
-            let craft_time_sec = costs
-                .and_then(|c| c.get("craftTime"))
-                .map(|t| {
-                    f(t, "days").unwrap_or(0.0) * 86_400.0
-                        + f(t, "hours").unwrap_or(0.0) * 3_600.0
-                        + f(t, "minutes").unwrap_or(0.0) * 60.0
-                        + f(t, "seconds").unwrap_or(0.0)
-                })
-                .unwrap_or(0.0);
+            let craft_time_sec = craft_time_sec(costs);
             let category = bp.get("category").and_then(|c| self.res.ref_name(c)).map(|n| n.trim_start_matches("BlueprintCategoryRecord.").to_string());
             let sources = self
                 .blueprint_sources
@@ -389,12 +397,7 @@ impl<'r, 'db, 'a> Normalizer<'r, 'db, 'a> {
                 let opts = arr(cost, "options");
                 let leaf = opts.iter().any(|o| matches!(ty(o), Some("CraftingCost_Resource") | Some("CraftingCost_Item")));
                 if leaf {
-                    let info = cost.get("nameInfo");
-                    let name = info
-                        .and_then(|n| s(n, "displayName"))
-                        .and_then(|k| self.loc.text_opt(k))
-                        .or_else(|| info.and_then(|n| s(n, "debugName")).map(title_case))
-                        .unwrap_or_else(|| "Material".into());
+                    let name = self.craft_slot_name(cost);
                     let count = i(cost, "count").unwrap_or(1).max(1) as u32;
                     let options: Vec<CraftInput> = opts.iter().filter_map(|o| self.craft_input(o)).collect();
                     if !options.is_empty() {
@@ -415,16 +418,30 @@ impl<'r, 'db, 'a> Normalizer<'r, 'db, 'a> {
         }
     }
 
+    /// English name of a slot (`CraftingCost_Select`): its display name, else its debug name in
+    /// title case.
+    fn craft_slot_name(&self, cost: &Value) -> String {
+        let info = cost.get("nameInfo");
+        info.and_then(|n| s(n, "displayName"))
+            .and_then(|k| self.loc.text_opt(k))
+            .or_else(|| info.and_then(|n| s(n, "debugName")).map(title_case))
+            .unwrap_or_else(|| "Material".into())
+    }
+
+    /// Name of the resource a `CraftingCost_Resource` (`o`, resource id `rid`) asks for.
+    fn resource_name(&self, o: &Value, rid: &str) -> String {
+        self.resource_names
+            .get(rid)
+            .cloned()
+            .or_else(|| o.get("resource").and_then(|r| self.res.ref_name(r)).map(|n| n.trim_start_matches("ResourceType.").to_string()))
+            .unwrap_or_else(|| "?".into())
+    }
+
     fn craft_input(&mut self, o: &Value) -> Option<CraftInput> {
         match ty(o)? {
             "CraftingCost_Resource" => {
                 let rid = o.get("resource").and_then(ref_id)?.to_string();
-                let name = self
-                    .resource_names
-                    .get(&rid)
-                    .cloned()
-                    .or_else(|| o.get("resource").and_then(|r| self.res.ref_name(r)).map(|n| n.trim_start_matches("ResourceType.").to_string()))
-                    .unwrap_or_else(|| "?".into());
+                let name = self.resource_name(o, &rid);
                 self.ensure_resource_item(&rid, &name);
                 let qty = o.get("quantity").and_then(|q| f(q, "standardCargoUnits")).unwrap_or(0.0);
                 Some(CraftInput {
@@ -468,6 +485,207 @@ impl<'r, 'db, 'a> Normalizer<'r, 'db, 'a> {
         });
     }
 
+    // ----- blueprints ----------------------------------------------------------------
+
+    /// Every creation blueprint of the build with where to get it. Unlike [`Self::load_crafting`]
+    /// it adds nothing to the item catalog (ids are set only for what the catalog holds), so it
+    /// runs once the catalog is complete.
+    fn load_blueprints(&mut self, contracts: &[Contract], faction_name: &str) -> Vec<Blueprint> {
+        let mut notes = BlueprintNotes::default();
+        let mut sources = self.blueprint_sources(contracts, faction_name, &mut notes);
+        let defaults = self.default_blueprints();
+        if defaults.is_none() {
+            notes.no_default_list = 1;
+        }
+        let mut out: Vec<Blueprint> = Vec::new();
+        for (name, rec) in self.res.records_of_type("CraftingBlueprintRecord") {
+            let root = match self.res.materialize(&rec) {
+                Ok(v) => record_value(&v),
+                Err(e) => {
+                    self.warnings.push(format!("{name}: {e}"));
+                    continue;
+                }
+            };
+            let id = rec.id.to_string();
+            let Some(mut bp) = blueprint_from_record(&id, short_record_name(&name), &root, self, &mut notes) else { continue };
+            // The record's own file in the game data (`libs/foundry/records/crafting/blueprints/...`).
+            let file_offset = rec.file_name_offset;
+            let path = self.res.db().resolve_string(file_offset).to_string();
+            describe_blueprint_item(&mut bp, &root, &path, defaults.as_ref(), self, &mut notes);
+            bp.sources = sources.remove(&id).unwrap_or_default();
+            out.push(bp);
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
+
+        let with_type = out.iter().filter(|b| b.item_type.is_some()).count();
+        let with_manufacturer = out.iter().filter(|b| b.manufacturer.is_some()).count();
+        let defaults_n = out.iter().filter(|b| b.default).count();
+        tracing::info!("blueprint items: {with_type} with an item type, {with_manufacturer} with a manufacturer, {defaults_n} default");
+        let with_sources = out.iter().filter(|b| !b.sources.is_empty()).count();
+        let with_offered = out.iter().filter(|b| b.sources.iter().any(|src| !src.disabled)).count();
+        let with_effects = out.iter().filter(|b| b.slots.iter().chain(&b.optional_slots).any(|slot| !slot.quality_effects.is_empty())).count();
+        let mut per_category: BTreeMap<&str, usize> = BTreeMap::new();
+        for b in &out {
+            *per_category.entry(b.category.as_deref().unwrap_or("-")).or_default() += 1;
+        }
+        let categories = per_category.iter().map(|(c, n)| format!("{c} {n}")).collect::<Vec<_>>().join(", ");
+        tracing::info!(
+            "blueprints: {} ({with_sources} with a source, {with_offered} with a source offered in this build, {with_effects} with quality effects; {} records left out as not a creation blueprint); by category: {categories}",
+            out.len(),
+            notes.not_creation
+        );
+        self.warnings.extend(notes.warnings());
+        out
+    }
+
+    /// Where each blueprint is granted, by blueprint record id: every contract result
+    /// (`BlueprintRewards`) of every generator, Wikelo's included, that draws from a pool
+    /// listing it.
+    fn blueprint_sources(&mut self, contracts: &[Contract], faction_name: &str, notes: &mut BlueprintNotes) -> HashMap<String, Vec<BlueprintSource>> {
+        struct Draw {
+            contract_id: String,
+            debug_name: String,
+            when: &'static str,
+            pool: String,
+            pool_id: String,
+            chance: f64,
+        }
+        let mut draws: Vec<Draw> = Vec::new();
+        // Pool record id -> each blueprint's share of the pool.
+        let mut pools: HashMap<String, Vec<(String, f64)>> = HashMap::new();
+        for (_, record) in self.res.records_of_type("ContractGenerator") {
+            // A generator that does not materialize was already reported by the mission rewards.
+            let Ok(v) = self.res.materialize(&record) else { continue };
+            let root = record_value(&v);
+            for g in arr(&root, "generators") {
+                for key in ["contracts", "introContracts", "legacyContracts"] {
+                    for c in arr(g, key) {
+                        let Some(contract_id) = s(c, "id") else { continue };
+                        let Some(results) = c.get("contractResults") else { continue };
+                        for r in arr(results, "contractResults") {
+                            if ty(r) != Some("BlueprintRewards") {
+                                continue;
+                            }
+                            let Some(when) = result_when(r) else {
+                                notes.other_moment += 1;
+                                continue;
+                            };
+                            let Some((pool_ref, pool_id)) = r.get("blueprintPool").and_then(|p| ref_id(p).map(|id| (p, id.to_string()))) else {
+                                notes.unresolved_pools += 1;
+                                continue;
+                            };
+                            if !pools.contains_key(&pool_id) {
+                                let Some(pool) = self.res.resolve_value(pool_ref) else {
+                                    notes.unresolved_pools += 1;
+                                    continue;
+                                };
+                                pools.insert(pool_id.clone(), pool_shares(&pool));
+                            }
+                            let (chance, clamped) = result_chance(f(r, "chance"));
+                            if clamped {
+                                notes.clamped_chances += 1;
+                            }
+                            draws.push(Draw {
+                                contract_id: contract_id.to_string(),
+                                debug_name: s(c, "debugName").unwrap_or("?").trim().to_string(),
+                                when,
+                                pool: fit(self.res.ref_name(pool_ref).map(|n| short_record_name(&n).to_string()).unwrap_or_else(|| pool_id.clone())),
+                                pool_id,
+                                chance,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Titles and givers as the dataset names them: Wikelo's contracts by their entry in
+        // `contracts`, every contract (Wikelo's too) the way `missions` describes it.
+        let wanted: HashSet<&str> = draws.iter().map(|d| d.contract_id.as_str()).collect();
+        let infos: HashMap<String, MissionInfo> =
+            crate::missions::describe_missions(&mut *self.res, self.loc, &wanted, false, &mut self.warnings).into_iter().map(|m| (m.id.clone(), m)).collect();
+        let wikelo: HashMap<&str, &str> = contracts.iter().map(|c| (c.id.as_str(), c.title.as_str())).collect();
+
+        let mut out: HashMap<String, Vec<BlueprintSource>> = HashMap::new();
+        for d in &draws {
+            let info = infos.get(&d.contract_id);
+            let wikelo_title = wikelo.get(d.contract_id.as_str()).copied();
+            let title = wikelo_title.map(str::to_string).or_else(|| info.map(|m| m.title.clone())).unwrap_or_else(|| d.debug_name.clone());
+            let giver = info.and_then(|m| m.giver.clone()).or_else(|| wikelo_title.map(|_| faction_name.to_string()));
+            for (bp_id, share) in pools.get(&d.pool_id).map(Vec::as_slice).unwrap_or(&[]) {
+                out.entry(bp_id.clone()).or_default().push(BlueprintSource {
+                    kind: "contract".into(),
+                    contract_id: d.contract_id.clone(),
+                    title: fit(title.clone()),
+                    giver: giver.clone().map(fit),
+                    when: d.when.into(),
+                    pool: d.pool.clone(),
+                    chance: (d.chance * share).min(1.0),
+                    pool_chance: pool_chance(d.chance),
+                    disabled: info.is_some_and(|m| m.disabled),
+                });
+            }
+        }
+        for list in out.values_mut() {
+            list.sort_by(|a, b| (&a.title, &a.contract_id, &a.when, &a.pool).cmp(&(&b.title, &b.contract_id, &b.when, &b.pool)).then(a.chance.total_cmp(&b.chance)));
+        }
+        out
+    }
+
+    /// The game's default blueprint list (`CraftingGlobalParams.defaultBlueprintSelection`),
+    /// read once per extraction. None when no such record holds a readable list.
+    fn default_blueprints(&mut self) -> Option<DefaultBlueprints> {
+        let mut out: Option<DefaultBlueprints> = None;
+        for (name, rec) in self.res.records_of_type("CraftingGlobalParams") {
+            let root = match self.res.materialize(&rec) {
+                Ok(v) => record_value(&v),
+                Err(e) => {
+                    self.warnings.push(format!("{name}: {e}"));
+                    continue;
+                }
+            };
+            if let Some(list) = default_blueprint_list(&root) {
+                let all = out.get_or_insert_with(DefaultBlueprints::default);
+                all.ids.extend(list.ids);
+                all.paths.extend(list.paths);
+            }
+        }
+        out
+    }
+
+    /// Like [`Self::craft_input`], without adding anything to the item catalog: the id is set
+    /// only when the catalog already holds the resource or the item.
+    fn blueprint_input(&mut self, o: &Value) -> Option<CraftInput> {
+        match ty(o)? {
+            "CraftingCost_Resource" => {
+                let rid = o.get("resource").and_then(ref_id)?.to_string();
+                let name = fit(self.resource_name(o, &rid));
+                Some(CraftInput {
+                    kind: "resource".into(),
+                    item_id: self.items.contains_key(&rid).then_some(rid),
+                    class_name: None,
+                    name,
+                    qty: o.get("quantity").and_then(|q| f(q, "standardCargoUnits")).unwrap_or(0.0),
+                    unit: Unit::Scu,
+                    min_quality: i(o, "minQuality").unwrap_or(0),
+                })
+            }
+            "CraftingCost_Item" => {
+                let (item_id, class_name, name) = self.item_face(o.get("entityClass")?)?;
+                Some(CraftInput {
+                    kind: "item".into(),
+                    item_id,
+                    class_name: Some(fit(class_name)),
+                    name: fit(name),
+                    qty: i(o, "quantity").unwrap_or(1) as f64,
+                    unit: Unit::Count,
+                    min_quality: i(o, "minQuality").unwrap_or(0),
+                })
+            }
+            _ => None,
+        }
+    }
+
     // ----- supporting databases ------------------------------------------------
 
     fn load_tag_names(&mut self) {
@@ -494,10 +712,15 @@ impl<'r, 'db, 'a> Normalizer<'r, 'db, 'a> {
                 let mut found: Vec<(String, String)> = Vec::new();
                 // (resource id, its quality table reference, the refined resource it turns into)
                 let mut tables: Vec<(String, Value, Option<String>)> = Vec::new();
+                // (record name without `ResourceType.` in lower case, resource id)
+                let mut by_record: Vec<(String, String)> = Vec::new();
                 walk(&root, &mut |node| {
                     if ty(node) == Some("ResourceType")
                         && let Some(id) = s(node, "_RecordId_")
                     {
+                        if let Some(record) = s(node, "_RecordName_") {
+                            by_record.push((record.trim_start_matches("ResourceType.").to_ascii_lowercase(), id.to_string()));
+                        }
                         let table = arr(node, "properties")
                             .iter()
                             .find_map(|p| p.get("qualityQuantization").and_then(|q| q.get("qualityQuantizationRecord")).filter(|r| ref_id(r).is_some()));
@@ -513,7 +736,14 @@ impl<'r, 'db, 'a> Normalizer<'r, 'db, 'a> {
                     }
                 });
                 self.resource_names.extend(found);
+                for (record, id) in by_record {
+                    self.resource_ids_by_record.entry(record).or_insert(id);
+                }
                 for (id, table, refined) in tables {
+                    // The link the quality tiers are named by (`load_quality_tiers`).
+                    if let Some(table_id) = ref_id(&table) {
+                        self.quantization_users.entry(table_id.to_string()).or_default().push((id.clone(), refined.clone()));
+                    }
                     let Some(rec) = self.res.resolve_value(&table) else { continue };
                     let mut values: Vec<i64> = rec
                         .get("qualityQuantization")
@@ -536,6 +766,94 @@ impl<'r, 'db, 'a> Normalizer<'r, 'db, 'a> {
         let (inherited, warnings) = refined_qualities(&self.resource_qualities, from_ores);
         self.resource_qualities.extend(inherited);
         self.warnings.extend(warnings);
+    }
+
+    /// The quality tiers of every crafting material: one per `CraftingQualityQuantizationRecord`
+    /// (`Quantization_<Material>`), sorted by key. The record names no material; the resources
+    /// do, through their `qualityQuantization` property, so a material is named after the
+    /// resources that point at its record (see [`pick_tier_name`]). A record nobody points at
+    /// takes the name of the resource whose record name is its key, and failing that its key
+    /// split into words. Unreadable records are left out and counted in one warning.
+    fn load_quality_tiers(&mut self, blueprints: &[Blueprint]) -> Vec<QualityTiers> {
+        const RECORD_PREFIX: &str = "CraftingQualityQuantizationRecord.Quantization_";
+        // What blueprint slots call their resource ingredients.
+        let slot_names: HashSet<&str> = blueprints
+            .iter()
+            .flat_map(|b| b.slots.iter().chain(&b.optional_slots))
+            .flat_map(|slot| &slot.options)
+            .filter(|o| o.kind == "resource")
+            .map(|o| o.name.as_str())
+            .collect();
+        // Resources with a table of their own, and the tables of the ores behind each refined one.
+        let owners: HashSet<&str> = self.quantization_users.values().flatten().map(|(id, _)| id.as_str()).collect();
+        let mut refined_tables: HashMap<&str, HashSet<&str>> = HashMap::new();
+        for (table, users) in &self.quantization_users {
+            for refined in users.iter().filter_map(|(_, refined)| refined.as_deref()) {
+                refined_tables.entry(refined).or_default().insert(table.as_str());
+            }
+        }
+        let resource_names = &self.resource_names;
+        let name_of = move |rid: &str| resource_names.get(rid).map(|n| n.trim()).filter(|n| valid_quality_tier_text(n));
+
+        let mut out: Vec<QualityTiers> = Vec::new();
+        let (mut unreadable, mut by_reference, mut by_record, mut by_key) = (0usize, 0usize, 0usize, 0usize);
+        for (record, rec) in self.res.records_of_type("CraftingQualityQuantizationRecord") {
+            let Some(key) = record.strip_prefix(RECORD_PREFIX).filter(|k| valid_quality_tier_text(k)) else {
+                unreadable += 1;
+                continue;
+            };
+            // The designers' starting point for new materials, not a material.
+            if key.eq_ignore_ascii_case("TEMPLATE") {
+                continue;
+            }
+            let Ok(v) = self.res.materialize(&rec) else {
+                unreadable += 1;
+                continue;
+            };
+            let Some(bands) = quality_bands(&record_value(&v)) else {
+                unreadable += 1;
+                continue;
+            };
+            let users: &[(String, Option<String>)] = self.quantization_users.get(&rec.id.to_string()).map(Vec::as_slice).unwrap_or(&[]);
+            // A refined resource counts only when it has no table of its own and every ore
+            // that turns into it uses this one.
+            let mut refined: Vec<&str> = users
+                .iter()
+                .filter_map(|(_, refined)| refined.as_deref())
+                .filter(|r| !owners.contains(r) && refined_tables.get(r).is_some_and(|tables| tables.len() == 1))
+                .filter_map(name_of)
+                .collect();
+            let mut direct: Vec<&str> = users.iter().filter_map(|(rid, _)| name_of(rid.as_str())).collect();
+            for names in [&mut refined, &mut direct] {
+                names.sort_unstable();
+                names.dedup();
+            }
+            let from_record = self.resource_ids_by_record.get(&key.to_ascii_lowercase()).and_then(|rid| name_of(rid.as_str()));
+            let (name, link) = pick_tier_name(key, &refined, &direct, from_record, &slot_names);
+            match link {
+                TierLink::Reference => by_reference += 1,
+                TierLink::RecordName => by_record += 1,
+                TierLink::Key => by_key += 1,
+            }
+            out.push(QualityTiers { key: key.to_string(), name, bands });
+        }
+        out.sort_by(|a, b| a.key.cmp(&b.key));
+        out.dedup_by(|a, b| a.key == b.key);
+        tracing::info!(
+            "quality tiers: {} materials ({by_reference} named through the resources that use them, {by_record} by record name, {by_key} from the key alone)",
+            out.len()
+        );
+        if out.len() > MAX_QUALITY_TIERS {
+            self.warnings.push(format!("quality tiers: {} materials, only the first {MAX_QUALITY_TIERS} by key are kept", out.len()));
+            out.truncate(MAX_QUALITY_TIERS);
+        }
+        if unreadable > 0 {
+            self.warnings.push(format!("quality tiers: {unreadable} quantization records without a usable Quantization_ name or readable bands, left out"));
+        }
+        if by_key > 0 {
+            self.warnings.push(format!("quality tiers: {by_key} materials matched to no resource, named from their record key"));
+        }
+        out
     }
 
     /// Every named place of the star map. The record name is the class Game.log writes in
@@ -1209,10 +1527,30 @@ impl<'r, 'db, 'a> Normalizer<'r, 'db, 'a> {
 
     /// Resolve an `EntityClassDefinition` reference into the item catalog.
     fn item(&mut self, eref: &Value) -> Option<Item> {
-        let id = ref_id(eref)?.to_string();
-        if let Some(it) = self.items.get(&id) {
+        let id = ref_id(eref)?;
+        if let Some(it) = self.items.get(id) {
             return Some(it.clone());
         }
+        let item = self.describe_item(eref)?;
+        self.items.insert(item.id.clone(), item.clone());
+        Some(item)
+    }
+
+    /// The crafted or asked-for item as (id when the catalog holds it, class name, English
+    /// name), without adding it to the catalog.
+    fn item_face(&mut self, eref: &Value) -> Option<(Option<String>, String, String)> {
+        let id = ref_id(eref)?;
+        if let Some(it) = self.items.get(id) {
+            return Some((Some(it.id.clone()), it.class_name.clone(), it.name.clone()));
+        }
+        let it = self.describe_item(eref)?;
+        Some((None, it.class_name, it.name))
+    }
+
+    /// What the catalog would hold for an `EntityClassDefinition` reference, read from the
+    /// game data (the catalog is not looked at nor changed).
+    fn describe_item(&mut self, eref: &Value) -> Option<Item> {
+        let id = ref_id(eref)?.to_string();
         let class_name = self
             .res
             .ref_name(eref)
@@ -1268,10 +1606,613 @@ impl<'r, 'db, 'a> Normalizer<'r, 'db, 'a> {
             .and_then(|k| self.loc.text_opt(k))
             .unwrap_or_else(|| class_name.clone());
         let kind = item_kind(&class_name, item_type.as_deref(), sub_type.as_deref(), &name);
-        let item = Item { id: id.clone(), class_name, name, item_type, sub_type, kind: kind.to_string(), image: None, image_source: None, qualities };
-        self.items.insert(id, item.clone());
-        Some(item)
+        Some(Item { id, class_name, name, item_type, sub_type, kind: kind.to_string(), image: None, image_source: None, qualities })
     }
+}
+
+// ----- blueprints --------------------------------------------------------------------------
+
+/// What reading a blueprint record needs besides the record itself. The [`Normalizer`]
+/// answers from DataCore and the localization; the tests answer from small tables.
+trait BlueprintReader {
+    /// One ingredient option (`CraftingCost_Resource` or `CraftingCost_Item`); None when unreadable.
+    fn input(&mut self, cost: &Value) -> Option<CraftInput>;
+    /// English name of a slot (`CraftingCost_Select`).
+    fn slot_name(&self, select: &Value) -> String;
+    /// English name of a gameplay property, from the record the reference points at.
+    fn property_name(&mut self, property: &Value) -> Option<String>;
+    /// The crafted item: (id when the item catalog holds it, class name, English name).
+    fn output(&mut self, entity: &Value) -> Option<(Option<String>, String, String)>;
+    /// Localized text of a key; None when missing or a placeholder.
+    fn text(&self, key: &str) -> Option<String>;
+    /// The record a reference points at (its `_RecordValue_`); None when it does not resolve.
+    fn record(&mut self, reference: &Value) -> Option<Rc<Value>>;
+}
+
+impl BlueprintReader for Normalizer<'_, '_, '_> {
+    fn input(&mut self, cost: &Value) -> Option<CraftInput> {
+        self.blueprint_input(cost)
+    }
+
+    fn slot_name(&self, select: &Value) -> String {
+        self.craft_slot_name(select)
+    }
+
+    fn property_name(&mut self, property: &Value) -> Option<String> {
+        let id = ref_id(property)?.to_string();
+        if let Some(name) = self.property_names.get(&id) {
+            return name.clone();
+        }
+        let loc = self.loc;
+        let name = self.res.resolve_value(property).and_then(|rec| localized_name(&rec, loc));
+        self.property_names.insert(id, name.clone());
+        name
+    }
+
+    fn output(&mut self, entity: &Value) -> Option<(Option<String>, String, String)> {
+        self.item_face(entity)
+    }
+
+    fn text(&self, key: &str) -> Option<String> {
+        self.loc.text_opt(key)
+    }
+
+    fn record(&mut self, reference: &Value) -> Option<Rc<Value>> {
+        self.res.resolve_value(reference)
+    }
+}
+
+/// What reading the blueprints met that the dataset does not carry, counted, so the
+/// extraction reports it in a few lines instead of one per record.
+#[derive(Debug, Default, PartialEq)]
+struct BlueprintNotes {
+    /// Records that are not creation blueprints (the game's generic dismantle one).
+    not_creation: usize,
+    /// Creation blueprints whose output item could not be read.
+    no_output: usize,
+    /// Record or output class names validation would refuse.
+    unsafe_names: usize,
+    /// Blueprints with more than one tier (only the first is read, as for `crafting`).
+    extra_tiers: usize,
+    /// Quality effects or quantity multipliers no slot owns (on a group, or on an ingredient).
+    unplaced: usize,
+    /// Groups of slots inside groups: their `count` is not kept.
+    nested_groups: usize,
+    /// Quality ranges of an unknown type, with missing values or outside the 0..=1000 scale.
+    skipped_ranges: usize,
+    /// Quality effects without a usable property key or without a usable range.
+    skipped_effects: usize,
+    /// Quantity multipliers that are not finite or outside 0..=`MAX_BLUEPRINT_VALUE`.
+    skipped_multipliers: usize,
+    /// Results whose chance was outside 0..=1, clamped.
+    clamped_chances: usize,
+    /// `BlueprintRewards` results whose pool did not resolve.
+    unresolved_pools: usize,
+    /// `BlueprintRewards` results that fire neither on accept nor on completion.
+    other_moment: usize,
+    /// Blueprints whose crafted item's record did not resolve: nothing about the item is kept.
+    no_item_record: usize,
+    /// Crafted items without an `SItemDefinition`: no type, size, grade, manufacturer or class.
+    no_item_definition: usize,
+    /// Item definitions whose `Type` is missing, empty or `UNDEFINED`.
+    no_item_type: usize,
+    /// Item definitions without a `Size` in 0..=`MAX_ITEM_SIZE`.
+    no_size: usize,
+    /// Item definitions without a `Grade` in 1..=`MAX_ITEM_GRADE`.
+    no_grade: usize,
+    /// Manufacturer references that did not resolve.
+    unresolved_manufacturers: usize,
+    /// Manufacturers without a usable `Code` or without a real English name.
+    unnamed_manufacturers: usize,
+    /// Type, sub type or class values validation would refuse (too long, control characters).
+    unusable_labels: usize,
+    /// Blueprint records whose path has no `blueprints/crafting/` folder: no tags.
+    no_tag_folder: usize,
+    /// Folders of a blueprint's path a tag cannot carry, or past the sixth.
+    dropped_tags: usize,
+    /// 1 when the game's default blueprint list was not found: no blueprint is marked default.
+    no_default_list: usize,
+}
+
+impl BlueprintNotes {
+    fn warnings(&self) -> Vec<String> {
+        [
+            (self.no_output, "creation blueprints without a readable output item, left out"),
+            (self.unsafe_names, "blueprints with a record or output class name the dataset cannot carry, left out"),
+            (self.extra_tiers, "blueprints with more than one tier; only the first is read"),
+            (self.unplaced, "quality effects or quantity multipliers outside a slot, not kept"),
+            (self.nested_groups, "groups of slots inside groups; their count is not kept"),
+            (self.skipped_ranges, "quality ranges of an unknown type or with unusable values, skipped"),
+            (self.skipped_effects, "quality effects without a property key or a usable range, skipped"),
+            (self.skipped_multipliers, "quantity multipliers with unusable values, skipped"),
+            (self.clamped_chances, "blueprint reward chances outside 0..1, clamped"),
+            (self.unresolved_pools, "blueprint reward results whose pool did not resolve"),
+            (self.other_moment, "blueprint reward results granted neither on accept nor on completion, skipped"),
+            (self.no_item_record, "blueprints whose crafted item record did not resolve; nothing about the item is kept"),
+            (self.no_item_definition, "blueprints whose crafted item has no SItemDefinition; no type, size, grade, manufacturer or class"),
+            (self.no_item_type, "blueprints whose crafted item has no type (missing or UNDEFINED)"),
+            (self.no_size, "blueprints whose crafted item has no size in 0..12"),
+            (self.no_grade, "blueprints whose crafted item has no grade in 1..9"),
+            (self.unresolved_manufacturers, "blueprints whose crafted item's manufacturer did not resolve"),
+            (self.unnamed_manufacturers, "blueprints whose crafted item's manufacturer has no code or no real name, left out"),
+            (self.unusable_labels, "item types, sub types or classes the dataset cannot carry, left out"),
+            (self.no_tag_folder, "blueprint records outside a blueprints/crafting/ folder, without tags"),
+            (self.dropped_tags, "blueprint path folders that cannot be tags (odd characters, or past the sixth), left out"),
+            (self.no_default_list, "default blueprint list (CraftingGlobalParams) not found; no blueprint is marked default"),
+        ]
+        .into_iter()
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, what)| format!("blueprints: {n} {what}"))
+        .collect()
+    }
+}
+
+/// One `CraftingBlueprintRecord` (its `_RecordValue_`, record id `id`, record name `name`
+/// without the type prefix) as a [`Blueprint`] with no sources yet. None, counted in `notes`,
+/// unless it is a creation blueprint with a readable output item.
+fn blueprint_from_record(id: &str, name: &str, root: &Value, reader: &mut dyn BlueprintReader, notes: &mut BlueprintNotes) -> Option<Blueprint> {
+    let Some(bp) = root.get("blueprint") else {
+        notes.not_creation += 1;
+        return None;
+    };
+    let process = bp.get("processSpecificData");
+    if process.and_then(ty) != Some("CraftingProcess_Creation") {
+        notes.not_creation += 1;
+        return None;
+    }
+    let Some((output_item_id, output_class_name, output_name)) = process.and_then(|p| p.get("entityClass")).and_then(|e| reader.output(e)) else {
+        notes.no_output += 1;
+        return None;
+    };
+    if !safe_class_name(name) || !safe_class_name(&output_class_name) {
+        notes.unsafe_names += 1;
+        return None;
+    }
+    let tiers = arr(bp, "tiers");
+    if tiers.len() > 1 {
+        notes.extra_tiers += 1;
+    }
+    let costs = tiers.first().and_then(|t| t.get("recipe")).and_then(|r| r.get("costs"));
+    let mut slots: Vec<BlueprintSlot> = Vec::new();
+    let mut optional_slots: Vec<BlueprintSlot> = Vec::new();
+    let mut slots_required = None;
+    if let Some(costs) = costs {
+        if let Some(m) = costs.get("mandatoryCost") {
+            if ty(m) == Some("CraftingCost_Select") && !is_slot(m) {
+                slots_required = i(m, "count").and_then(|n| u32::try_from(n).ok());
+            }
+            read_cost(m, 0, reader, &mut slots, notes);
+        }
+        for o in arr(costs, "optionalCosts") {
+            read_cost(o, 0, reader, &mut optional_slots, notes);
+        }
+    }
+    Some(Blueprint {
+        id: id.to_string(),
+        name: name.to_string(),
+        display_name: s(bp, "blueprintName").and_then(|k| reader.text(k)).filter(|t| real_place_name(t)).map(fit),
+        category: bp.get("category").and_then(short_ref_name).map(fit),
+        output_item_id,
+        // An item whose name the game left as a placeholder is shown by its class name.
+        output_name: fit(if real_place_name(&output_name) { output_name } else { output_class_name.clone() }),
+        output_class_name,
+        craft_time_sec: craft_time_sec(costs),
+        slots_required,
+        slots,
+        optional_slots,
+        sources: Vec::new(),
+        ..Default::default()
+    })
+}
+
+/// The blueprints the game hands every player (`CraftingGlobalParams.defaultBlueprintSelection`),
+/// by record id and by [`blueprint_path_key`], since a reference may come as either.
+#[derive(Debug, Default, PartialEq)]
+struct DefaultBlueprints {
+    ids: HashSet<String>,
+    paths: HashSet<String>,
+}
+
+impl DefaultBlueprints {
+    /// Is the blueprint with record id `id`, whose record file is `path`, on the list?
+    fn contains(&self, id: &str, path: &str) -> bool {
+        self.ids.contains(id) || blueprint_path_key(path).is_some_and(|k| self.paths.contains(&k))
+    }
+}
+
+/// The `blueprintRecords` of a `CraftingGlobalParams` record value; None when it has no such
+/// list (another kind of selection, or no selection).
+fn default_blueprint_list(params: &Value) -> Option<DefaultBlueprints> {
+    let list = params.get("defaultBlueprintSelection")?.get("blueprintRecords")?.as_array()?;
+    let mut out = DefaultBlueprints::default();
+    for entry in list {
+        if let Some(id) = ref_id(entry) {
+            out.ids.insert(id.to_string());
+        }
+        let path = entry.get("$path").or_else(|| entry.get("_RecordPath_")).and_then(Value::as_str).or_else(|| entry.as_str());
+        if let Some(key) = path.and_then(blueprint_path_key) {
+            out.paths.insert(key);
+        }
+    }
+    Some(out)
+}
+
+/// What follows `blueprints/` in a record path, in lower case with `/` separators, so a
+/// record's own path (`libs/foundry/records/crafting/blueprints/crafting/x.json`) and a
+/// reference to it (`file://./../../libs/.../blueprints/crafting/x.json`) give the same key.
+fn blueprint_path_key(path: &str) -> Option<String> {
+    let path = format!("/{}", path.replace('\\', "/").to_ascii_lowercase());
+    const ANCHOR: &str = "/blueprints/";
+    let at = path.find(ANCHOR)? + ANCHOR.len();
+    let key = &path[at..];
+    (!key.is_empty()).then(|| key.to_string())
+}
+
+/// The folders of a blueprint record's path after `blueprints/crafting/`, in lower case and
+/// without the file name (`.../blueprints/crafting/fpsgear/weapons/rifle/bp_x.json` gives
+/// `fpsgear`, `weapons`, `rifle`), with how many folders were left out because a tag cannot
+/// carry them or because [`MAX_BLUEPRINT_TAGS`] were already taken. None when the path has
+/// no `blueprints/crafting/` folder.
+fn blueprint_tags(path: &str) -> Option<(Vec<String>, usize)> {
+    let path = format!("/{}", path.replace('\\', "/").to_ascii_lowercase());
+    const ANCHOR: &str = "/blueprints/crafting/";
+    let at = path.find(ANCHOR)? + ANCHOR.len();
+    let mut folders: Vec<&str> = path[at..].split('/').collect();
+    folders.pop(); // the file name
+    let mut tags: Vec<String> = Vec::new();
+    let mut dropped = 0;
+    for folder in folders.into_iter().filter(|f| !f.is_empty()) {
+        if tags.len() < MAX_BLUEPRINT_TAGS && valid_blueprint_tag(folder) {
+            tags.push(folder.to_string());
+        } else {
+            dropped += 1;
+        }
+    }
+    Some((tags, dropped))
+}
+
+/// Fills in what a blueprint says about its crafted item (`item_type` to `item_class`, read
+/// from the item's record), its `tags` (from `path`, the blueprint record's own file) and
+/// `default` (from `defaults`, None when the game's list was not found). `root` is the
+/// blueprint record's value. What cannot be read is left out and counted in `notes`.
+fn describe_blueprint_item(bp: &mut Blueprint, root: &Value, path: &str, defaults: Option<&DefaultBlueprints>, reader: &mut dyn BlueprintReader, notes: &mut BlueprintNotes) {
+    let entity = root.get("blueprint").and_then(|b| b.get("processSpecificData")).and_then(|p| p.get("entityClass"));
+    match entity.and_then(|e| reader.record(e)) {
+        Some(item) => item_facts(bp, &item, reader, notes),
+        None => notes.no_item_record += 1,
+    }
+    match blueprint_tags(path) {
+        Some((tags, dropped)) => {
+            bp.tags = tags;
+            notes.dropped_tags += dropped;
+        }
+        None => notes.no_tag_folder += 1,
+    }
+    bp.default = defaults.is_some_and(|d| d.contains(&bp.id, path));
+}
+
+/// Type, sub type, size, grade, manufacturer and class of a crafted item, from its record
+/// value `item`, onto `bp`.
+fn item_facts(bp: &mut Blueprint, item: &Value, reader: &mut dyn BlueprintReader, notes: &mut BlueprintNotes) {
+    let Some(def) = item_definition(item) else {
+        notes.no_item_definition += 1;
+        return;
+    };
+    let item_type = s(def, "Type").map(str::trim).unwrap_or("");
+    if item_type.is_empty() || item_type.eq_ignore_ascii_case("UNDEFINED") {
+        notes.no_item_type += 1;
+    }
+    bp.item_type = item_label(Some(item_type), notes);
+    // `UNDEFINED` is what most items without a sub type say: not a miss.
+    bp.item_sub_type = item_label(s(def, "SubType"), notes);
+    bp.size = i(def, "Size").and_then(|n| u32::try_from(n).ok()).filter(|n| *n <= MAX_ITEM_SIZE);
+    if bp.size.is_none() {
+        notes.no_size += 1;
+    }
+    bp.grade = i(def, "Grade").and_then(|n| u32::try_from(n).ok()).filter(|n| (1..=MAX_ITEM_GRADE).contains(n));
+    if bp.grade.is_none() {
+        notes.no_grade += 1;
+    }
+    bp.manufacturer = item_manufacturer(def.get("Manufacturer"), reader, notes);
+    let description = def.get("Localization").and_then(|l| s(l, "Description")).and_then(|k| reader.text(k));
+    bp.item_class = item_label(description.as_deref().and_then(description_class), notes);
+}
+
+/// The crafted item's `SItemDefinition`: the `AttachDef` of its components that says so, else
+/// the one of its `SAttachableComponentParams`.
+fn item_definition(item: &Value) -> Option<&Value> {
+    let components = arr(item, "Components");
+    components.iter().filter_map(|c| c.get("AttachDef")).find(|d| ty(d) == Some("SItemDefinition")).or_else(|| {
+        components
+            .iter()
+            .find(|c| ty(c) == Some("SAttachableComponentParams"))
+            .and_then(|c| c.get("AttachDef"))
+            .filter(|d| d.is_object())
+    })
+}
+
+/// A game value for `item_type`, `item_sub_type` or `item_class`, trimmed: None when absent,
+/// empty or `UNDEFINED`; None, and counted, when validation would refuse it.
+fn item_label(value: Option<&str>, notes: &mut BlueprintNotes) -> Option<String> {
+    let value = value.map(str::trim).filter(|v| !v.is_empty() && !v.eq_ignore_ascii_case("UNDEFINED"))?;
+    if valid_blueprint_label(value, MAX_BLUEPRINT_LABEL) {
+        Some(value.to_string())
+    } else {
+        notes.unusable_labels += 1;
+        None
+    }
+}
+
+/// The manufacturer an item definition's `Manufacturer` reference points at: its `Code` and
+/// English name. None when there is no reference (null, empty, the all-zero id); None, and
+/// counted, when it does not resolve or has no usable code or no real name.
+fn item_manufacturer(reference: Option<&Value>, reader: &mut dyn BlueprintReader, notes: &mut BlueprintNotes) -> Option<BlueprintManufacturer> {
+    const NO_RECORD: &str = "00000000-0000-0000-0000-000000000000";
+    let reference = reference.filter(|r| !r.is_null() && !r.as_str().is_some_and(|p| p.trim().is_empty()) && ref_id(r) != Some(NO_RECORD))?;
+    let Some(rec) = reader.record(reference) else {
+        notes.unresolved_manufacturers += 1;
+        return None;
+    };
+    let code = s(&rec, "Code").map(str::trim).filter(|c| valid_blueprint_label(c, MAX_MANUFACTURER_CODE)).map(str::to_string);
+    let name = rec
+        .get("Localization")
+        .and_then(|l| s(l, "Name"))
+        .and_then(|k| reader.text(k))
+        .map(|t| t.trim().to_string())
+        .filter(|t| real_place_name(t) && valid_blueprint_label(t, MAX_MANUFACTURER_NAME));
+    match (code, name) {
+        (Some(code), Some(name)) => Some(BlueprintManufacturer { code, name }),
+        _ => {
+            notes.unnamed_manufacturers += 1;
+            None
+        }
+    }
+}
+
+/// The value of the `Class:` line among the `Key: value` lines that open an item description
+/// (`Item Type: Cooler`, `Size: 1`, `Class: Competition`, before the first blank line), in
+/// whatever position it comes; None when the opening lines have none.
+fn description_class(text: &str) -> Option<&str> {
+    text.lines().map(str::trim).skip_while(|l| l.is_empty()).take_while(|l| !l.is_empty()).find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        let value = value.trim();
+        (key.trim().eq_ignore_ascii_case("class") && !value.is_empty()).then_some(value)
+    })
+}
+
+/// A `CraftingCost_Select` whose options include ingredients: a slot (the others group slots).
+fn is_slot(select: &Value) -> bool {
+    arr(select, "options").iter().any(|o| matches!(ty(o), Some("CraftingCost_Resource") | Some("CraftingCost_Item")))
+}
+
+/// Reads a cost tree into slots the way [`Normalizer::craft_slots`] does (a select with
+/// ingredients is a slot, a select of selects a group read through, a bare ingredient a slot
+/// of its own), and keeps what that one drops: the quality effects and quantity multipliers.
+fn read_cost(cost: &Value, depth: usize, reader: &mut dyn BlueprintReader, slots: &mut Vec<BlueprintSlot>, notes: &mut BlueprintNotes) {
+    match ty(cost) {
+        Some("CraftingCost_Select") if is_slot(cost) => {
+            let mut options: Vec<CraftInput> = Vec::new();
+            let mut quantity_multipliers: Vec<QuantityMultiplier> =
+                quantity_multipliers(cost, notes).into_iter().map(|multiplier| QuantityMultiplier { option: None, multiplier }).collect();
+            for o in arr(cost, "options") {
+                let Some(input) = reader.input(o) else { continue };
+                let option = Some(options.len() as u32);
+                quantity_multipliers.extend(quantity_multipliers_of(o, option, notes));
+                notes.unplaced += property_modifiers(o).count();
+                options.push(input);
+            }
+            let quality_effects = quality_effects(cost, reader, notes);
+            if options.is_empty() {
+                notes.unplaced += quality_effects.len() + quantity_multipliers.len();
+                return;
+            }
+            slots.push(BlueprintSlot {
+                name: fit(reader.slot_name(cost)),
+                count: i(cost, "count").and_then(|n| u32::try_from(n).ok()).unwrap_or(1),
+                options,
+                quantity_multipliers,
+                quality_effects,
+            });
+        }
+        Some("CraftingCost_Select") => {
+            if depth > 0 {
+                notes.nested_groups += 1;
+            }
+            let unplaced = property_modifiers(cost).count() + quantity_multipliers(cost, notes).len();
+            notes.unplaced += unplaced;
+            for o in arr(cost, "options") {
+                read_cost(o, depth + 1, reader, slots, notes);
+            }
+        }
+        Some("CraftingCost_Resource") | Some("CraftingCost_Item") => {
+            let Some(input) = reader.input(cost) else { return };
+            let quantity_multipliers = quantity_multipliers_of(cost, Some(0), notes);
+            let quality_effects = quality_effects(cost, reader, notes);
+            slots.push(BlueprintSlot { name: fit(input.name.clone()), count: 1, options: vec![input], quantity_multipliers, quality_effects });
+        }
+        _ => {}
+    }
+}
+
+/// The `CraftingCostContext_QuantityMultiplier` values on a cost node; unusable ones are
+/// counted in `notes` and left out.
+fn quantity_multipliers(cost: &Value, notes: &mut BlueprintNotes) -> Vec<f64> {
+    let mut out = Vec::new();
+    for c in arr(cost, "context").iter().filter(|c| ty(c) == Some("CraftingCostContext_QuantityMultiplier")) {
+        match f(c, "multiplier") {
+            Some(m) if finite_value(m) && m >= 0.0 => out.push(m),
+            _ => notes.skipped_multipliers += 1,
+        }
+    }
+    out
+}
+
+/// [`quantity_multipliers`] of a cost node, tagged with the option index they belong to.
+fn quantity_multipliers_of(cost: &Value, option: Option<u32>, notes: &mut BlueprintNotes) -> Vec<QuantityMultiplier> {
+    quantity_multipliers(cost, notes).into_iter().map(|multiplier| QuantityMultiplier { option, multiplier }).collect()
+}
+
+/// The `CraftingGameplayPropertyModifierCommon` entries in a cost node's context.
+fn property_modifiers(cost: &Value) -> impl Iterator<Item = &Value> {
+    arr(cost, "context")
+        .iter()
+        .filter(|c| ty(c) == Some("CraftingCostContext_ResultGameplayPropertyModifiers"))
+        .flat_map(|c| match c.get("gameplayPropertyModifiers") {
+            // `CraftingGameplayPropertyModifiers_List { gameplayPropertyModifiers: [...] }`, or a bare list.
+            Some(Value::Array(list)) => list.as_slice(),
+            Some(list) => arr(list, "gameplayPropertyModifiers"),
+            None => &[],
+        })
+}
+
+/// What a slot's quality changes, one entry per gameplay property, as the record lists them.
+fn quality_effects(cost: &Value, reader: &mut dyn BlueprintReader, notes: &mut BlueprintNotes) -> Vec<QualityEffect> {
+    let mut out = Vec::new();
+    for m in property_modifiers(cost) {
+        let property = m.get("gameplayPropertyRecord");
+        let Some(key) = property.and_then(property_key).filter(|k| safe_class_name(k)) else {
+            notes.skipped_effects += 1;
+            continue;
+        };
+        let mut ranges = Vec::new();
+        for r in arr(m, "valueRanges") {
+            match quality_range(r) {
+                Some(range) => ranges.push(range),
+                None => notes.skipped_ranges += 1,
+            }
+        }
+        if ranges.is_empty() {
+            notes.skipped_effects += 1;
+            continue;
+        }
+        let name = property.and_then(|p| reader.property_name(p)).map(fit);
+        out.push(QualityEffect { key, name, ranges });
+    }
+    out
+}
+
+/// One `CraftingGameplayPropertyModifierValueRange_*`, as written; None for an unknown type,
+/// a missing value, or a quality outside the game's 0..=1000 scale.
+fn quality_range(r: &Value) -> Option<QualityRange> {
+    let (kind, at_start_key, at_end_key) = match ty(r)? {
+        "CraftingGameplayPropertyModifierValueRange_Linear" => (QualityRangeKind::Linear, "modifierAtStart", "modifierAtEnd"),
+        "CraftingGameplayPropertyModifierValueRange_LinearIntegerAdditive" => (QualityRangeKind::IntegerAdditive, "additiveModifierAtStart", "additiveModifierAtEnd"),
+        _ => return None,
+    };
+    let range = QualityRange { kind, start_quality: i(r, "startQuality")?, end_quality: i(r, "endQuality")?, at_start: f(r, at_start_key)?, at_end: f(r, at_end_key)? };
+    let scale = 0..=MAX_QUALITY;
+    (scale.contains(&range.start_quality) && scale.contains(&range.end_quality) && finite_value(range.at_start) && finite_value(range.at_end)).then_some(range)
+}
+
+/// Finite and within ±`MAX_BLUEPRINT_VALUE`, as validation demands.
+fn finite_value(v: f64) -> bool {
+    v.is_finite() && v.abs() <= MAX_BLUEPRINT_VALUE
+}
+
+/// Name of the record a reference points at, without its type prefix (`gpp_weapon_recoil_kick`):
+/// from the reference's record name, else from the file name of its path.
+fn property_key(v: &Value) -> Option<String> {
+    let named = v.get("$name").or_else(|| v.get("_RecordName_")).and_then(Value::as_str).map(short_record_name);
+    let key = named.or_else(|| {
+        let path = v.get("$path").and_then(Value::as_str).or_else(|| v.as_str())?;
+        let file = path.rsplit(['/', '\\']).next()?;
+        Some(file.strip_suffix(".json").unwrap_or(file))
+    })?;
+    let key = key.trim();
+    (!key.is_empty()).then(|| key.to_string())
+}
+
+/// `BlueprintPoolRecord.BP_REWARDS_X` -> `BP_REWARDS_X`: a record name without its type prefix.
+fn short_record_name(name: &str) -> &str {
+    name.split_once('.').map_or(name, |(_, rest)| rest)
+}
+
+/// The record name of a reference (`$ref` object or sub-record), without its type prefix.
+fn short_ref_name(v: &Value) -> Option<String> {
+    v.get("$name").or_else(|| v.get("_RecordName_")).and_then(Value::as_str).map(|n| short_record_name(n).to_string())
+}
+
+/// The English name a record carries: its `displayName` key, else the first other `@` key in
+/// a field whose name says "name". None when none of them resolves to real text.
+fn localized_name(rec: &Value, loc: &Localization) -> Option<String> {
+    let map = rec.as_object()?;
+    let others = map.iter().filter(|(k, _)| k.as_str() != "displayName" && k.to_ascii_lowercase().contains("name")).map(|(_, v)| v);
+    map.get("displayName")
+        .into_iter()
+        .chain(others)
+        .filter_map(Value::as_str)
+        .filter(|k| k.starts_with('@'))
+        .find_map(|k| loc.text_opt(k))
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+}
+
+/// Each blueprint's share of a `BlueprintPoolRecord`: its weight over the sum of every
+/// entry's weight. Entries without a blueprint count in the sum, as the record lists them; a
+/// blueprint listed twice adds its weights; a missing weight is 1 (as the Wikelo rewards read
+/// it), a negative or non-finite one 0. Empty when the total is not positive.
+fn pool_shares(pool: &Value) -> Vec<(String, f64)> {
+    let weight = |e: &Value| match f(e, "weight").unwrap_or(1.0) {
+        w if w.is_finite() && w > 0.0 => w,
+        _ => 0.0,
+    };
+    let entries = arr(pool, "blueprintRewards");
+    let total: f64 = entries.iter().map(weight).sum();
+    if total <= 0.0 {
+        return Vec::new();
+    }
+    let mut weights: Vec<(String, f64)> = Vec::new();
+    for e in entries {
+        let Some(id) = e.get("blueprintRecord").and_then(ref_id) else { continue };
+        match weights.iter_mut().find(|(known, _)| known == id) {
+            Some((_, w)) => *w += weight(e),
+            None => weights.push((id.to_string(), weight(e))),
+        }
+    }
+    weights.into_iter().map(|(id, w)| (id, (w / total).min(1.0))).collect()
+}
+
+/// When a contract result grants its reward: `complete` when it fires on success, else
+/// `accept` when it fires on accept (the order the Wikelo rewards are read in); None for a
+/// result that does neither.
+fn result_when(r: &Value) -> Option<&'static str> {
+    if applies_on_success(r) {
+        Some("complete")
+    } else if applies_on_accept(r) {
+        Some("accept")
+    } else {
+        None
+    }
+}
+
+/// A result's `chance` as a probability: missing is 1 (as the Wikelo rewards read it), a value
+/// outside 0..=1 is clamped; the flag says it was.
+fn result_chance(chance: Option<f64>) -> (f64, bool) {
+    let c = chance.unwrap_or(1.0);
+    if !c.is_finite() {
+        return (0.0, true);
+    }
+    (c.clamp(0.0, 1.0), !(0.0..=1.0).contains(&c))
+}
+
+/// [`BlueprintSource::pool_chance`] from a result's chance (as [`result_chance`] gives it):
+/// kept only when the mission does not always give a blueprint of the pool.
+fn pool_chance(chance: f64) -> Option<f64> {
+    (chance < 1.0).then_some(chance)
+}
+
+/// `TimeValue_Partitioned` of a recipe's costs, in seconds (0 when absent).
+fn craft_time_sec(costs: Option<&Value>) -> f64 {
+    costs
+        .and_then(|c| c.get("craftTime"))
+        .map(|t| f(t, "days").unwrap_or(0.0) * 86_400.0 + f(t, "hours").unwrap_or(0.0) * 3_600.0 + f(t, "minutes").unwrap_or(0.0) * 60.0 + f(t, "seconds").unwrap_or(0.0))
+        .unwrap_or(0.0)
+}
+
+/// At most 200 characters (the longest short text validation accepts), so one odd string in
+/// the game data cannot get the whole dataset refused.
+fn fit(s: String) -> String {
+    if s.chars().count() <= 200 { s } else { s.chars().take(200).collect() }
 }
 
 // ----- helpers -------------------------------------------------------------------------
@@ -1428,6 +2369,65 @@ fn refined_qualities(own: &HashMap<String, Vec<i64>>, from_ores: BTreeMap<String
     (out, warnings)
 }
 
+/// The bands of a `CraftingQualityQuantizationRecord` value (`qualityQuantization.bands`),
+/// ascending. None when a band lacks `start`, `end` or `mappedValue`, or when the bands break
+/// [`valid_quality_bands`] (none or too many, outside 0..=1000, inverted, overlapping).
+fn quality_bands(root: &Value) -> Option<Vec<QualityBand>> {
+    let list = arr(root.get("qualityQuantization")?, "bands");
+    let mut bands: Vec<QualityBand> =
+        list.iter().map(|b| Some(QualityBand { start: i(b, "start")?, end: i(b, "end")?, value: i(b, "mappedValue")? })).collect::<Option<Vec<_>>>()?;
+    bands.sort_by_key(|b| (b.start, b.end));
+    valid_quality_bands(&bands).then_some(bands)
+}
+
+/// How a material's quality tiers got their name (see [`pick_tier_name`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TierLink {
+    /// From a resource whose `qualityQuantization` property points at the record.
+    Reference,
+    /// From the resource whose record name is the material's key.
+    RecordName,
+    /// No resource: the key split into words.
+    Key,
+}
+
+/// The name of a material's quality tiers. `refined`: names of the refined resources the
+/// record's ores turn into; `direct`: names of the resources that point at the record
+/// themselves; `by_record`: name of the resource whose record name is `key`. A name blueprint
+/// slots use (`slot_names`) wins, then a refined resource (what the player stores and crafts
+/// with), then a direct one, then the record name match, then `key` split into words.
+fn pick_tier_name(key: &str, refined: &[&str], direct: &[&str], by_record: Option<&str>, slot_names: &HashSet<&str>) -> (String, TierLink) {
+    if let Some(name) = refined.iter().chain(direct).find(|n| slot_names.contains(**n)) {
+        return ((*name).to_string(), TierLink::Reference);
+    }
+    if let Some(name) = refined.first().or(direct.first()) {
+        return ((*name).to_string(), TierLink::Reference);
+    }
+    if let Some(name) = by_record {
+        return (name.to_string(), TierLink::RecordName);
+    }
+    (words_of_key(key), TierLink::Key)
+}
+
+/// A record key split into words: a space before a capital that follows a lower-case letter or
+/// a digit, or that starts a word after an acronym (`JumpingLimes` -> `Jumping Limes`,
+/// `VLKFang` -> `VLK Fang`, `TEMPLATE` unchanged).
+fn words_of_key(key: &str) -> String {
+    let chars: Vec<char> = key.chars().collect();
+    let mut out = String::with_capacity(key.len() + 4);
+    for (n, &c) in chars.iter().enumerate() {
+        if n > 0 && c.is_uppercase() {
+            let prev = chars[n - 1];
+            let starts_word_after_acronym = prev.is_uppercase() && chars.get(n + 1).is_some_and(|next| next.is_lowercase());
+            if prev.is_lowercase() || prev.is_ascii_digit() || starts_word_after_acronym {
+                out.push(' ');
+            }
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// A `StarMapObject` as far as the location climb needs it: its display name (when it has a
 /// real one), its map icon, and the record it hangs from.
 struct MapNode {
@@ -1512,6 +2512,540 @@ pub fn walk<'v>(v: &'v Value, f: &mut dyn FnMut(&'v Value)) {
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod blueprint_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Answers from the record alone: names are the references' record names.
+    struct TableReader;
+
+    impl BlueprintReader for TableReader {
+        fn input(&mut self, cost: &Value) -> Option<CraftInput> {
+            let (kind, reference, qty, unit) = match ty(cost)? {
+                "CraftingCost_Resource" => ("resource", cost.get("resource")?, cost.get("quantity").and_then(|q| f(q, "standardCargoUnits")).unwrap_or(0.0), Unit::Scu),
+                "CraftingCost_Item" => ("item", cost.get("entityClass")?, i(cost, "quantity").unwrap_or(1) as f64, Unit::Count),
+                _ => return None,
+            };
+            Some(CraftInput {
+                kind: kind.into(),
+                item_id: ref_id(reference).map(str::to_string),
+                class_name: None,
+                name: short_ref_name(reference)?,
+                qty,
+                unit,
+                min_quality: i(cost, "minQuality").unwrap_or(0),
+            })
+        }
+
+        fn slot_name(&self, select: &Value) -> String {
+            select.get("nameInfo").and_then(|n| s(n, "debugName")).map(title_case).unwrap_or_default()
+        }
+
+        fn property_name(&mut self, property: &Value) -> Option<String> {
+            (property_key(property)?.as_str() == "gpp_weapon_damage").then(|| "Damage".to_string())
+        }
+
+        fn output(&mut self, entity: &Value) -> Option<(Option<String>, String, String)> {
+            let class = short_ref_name(entity)?;
+            Some((ref_id(entity).map(str::to_string), class.clone(), class.replace('_', " ")))
+        }
+
+        fn text(&self, key: &str) -> Option<String> {
+            (key == "@mission_item_0075").then(|| "Microsatellite".to_string())
+        }
+
+        fn record(&mut self, _reference: &Value) -> Option<Rc<Value>> {
+            None
+        }
+    }
+
+    /// Answers records (by reference id) and texts (by key, `@` included) from tables, the
+    /// rest as [`TableReader`] does.
+    #[derive(Default)]
+    struct RecordReader {
+        records: HashMap<String, Value>,
+        texts: HashMap<String, String>,
+    }
+
+    impl BlueprintReader for RecordReader {
+        fn input(&mut self, cost: &Value) -> Option<CraftInput> {
+            TableReader.input(cost)
+        }
+
+        fn slot_name(&self, select: &Value) -> String {
+            TableReader.slot_name(select)
+        }
+
+        fn property_name(&mut self, property: &Value) -> Option<String> {
+            TableReader.property_name(property)
+        }
+
+        fn output(&mut self, entity: &Value) -> Option<(Option<String>, String, String)> {
+            TableReader.output(entity)
+        }
+
+        fn text(&self, key: &str) -> Option<String> {
+            self.texts.get(key).cloned()
+        }
+
+        fn record(&mut self, reference: &Value) -> Option<Rc<Value>> {
+            self.records.get(ref_id(reference)?).cloned().map(Rc::new)
+        }
+    }
+
+    fn reference(name: &str, id: &str) -> Value {
+        json!({ "$ref": id, "$name": name, "$path": format!("file://./records/{}.json", short_record_name(name).to_ascii_lowercase()) })
+    }
+
+    fn resource(name: &str, scu: f64, min_quality: i64, context: Value) -> Value {
+        json!({
+            "_Type_": "CraftingCost_Resource", "context": context,
+            "resource": reference(&format!("ResourceType.{name}"), &format!("res-{name}")),
+            "quantity": { "_Type_": "SStandardCargoUnit", "standardCargoUnits": scu },
+            "minQuality": min_quality
+        })
+    }
+
+    fn linear(start: i64, end: i64, at_start: f64, at_end: f64) -> Value {
+        json!({ "_Type_": "CraftingGameplayPropertyModifierValueRange_Linear", "startQuality": start, "endQuality": end, "modifierAtStart": at_start, "modifierAtEnd": at_end })
+    }
+
+    fn additive(start: i64, end: i64, at_start: i64, at_end: i64) -> Value {
+        json!({ "_Type_": "CraftingGameplayPropertyModifierValueRange_LinearIntegerAdditive", "startQuality": start, "endQuality": end, "additiveModifierAtStart": at_start, "additiveModifierAtEnd": at_end })
+    }
+
+    /// A `ResultGameplayPropertyModifiers` context: (property reference, its value ranges) each.
+    fn modifiers(list: Vec<(Value, Vec<Value>)>) -> Value {
+        let list: Vec<Value> = list.into_iter().map(|(p, ranges)| json!({ "_Type_": "CraftingGameplayPropertyModifierCommon", "gameplayPropertyRecord": p, "valueRanges": ranges })).collect();
+        json!({ "_Type_": "CraftingCostContext_ResultGameplayPropertyModifiers", "gameplayPropertyModifiers": { "_Type_": "CraftingGameplayPropertyModifiers_List", "gameplayPropertyModifiers": list } })
+    }
+
+    fn slot(debug_name: &str, context: Vec<Value>, options: Vec<Value>) -> Value {
+        json!({
+            "_Type_": "CraftingCost_Select", "context": context,
+            "nameInfo": { "_Type_": "CraftingNameInfo", "debugName": debug_name, "displayName": "@LOC_PLACEHOLDER" },
+            "count": 1, "options": options
+        })
+    }
+
+    /// A `CraftingBlueprintRecord` value laid out like the game's (`behr_rifle_ballistic_01`).
+    fn record(mandatory: Value, optional: Vec<Value>) -> Value {
+        json!({
+            "_Type_": "CraftingBlueprintRecord",
+            "blueprint": {
+                "_Type_": "CraftingBlueprint",
+                "category": { "_RecordName_": "BlueprintCategoryRecord.FPSWeapons", "_RecordId_": "cat" },
+                "blueprintName": "@LOC_PLACEHOLDER",
+                "processSpecificData": { "_Type_": "CraftingProcess_Creation", "entityClass": reference("EntityClassDefinition.behr_rifle_ballistic_01", "out") },
+                "tiers": [{
+                    "_Type_": "CraftingBlueprintTier",
+                    "recipe": { "_Type_": "CraftingRecipe", "processSpecificData": null, "costs": {
+                        "_Type_": "CraftingRecipeCosts",
+                        "craftTime": { "_Type_": "TimeValue_Partitioned", "days": 0, "hours": 1, "minutes": 2, "seconds": 30.0 },
+                        "mandatoryCost": mandatory,
+                        "optionalCosts": optional
+                    }, "results": null },
+                    "research": null
+                }]
+            }
+        })
+    }
+
+    #[test]
+    fn a_blueprint_keeps_its_slots_quality_effects_and_multipliers() {
+        let kick = reference("CraftingGameplayPropertyRecord.gpp_weapon_recoil_kick", "p-kick");
+        // The game's dumps write some references as a bare path.
+        let damage = json!("file://./../../crafting/craftedproperties/gpp_weapon_damage.json");
+        let unknown = json!({ "_Type_": "CraftingGameplayPropertyModifierValueRange_Stepped", "startQuality": 0, "endQuality": 1 });
+        let frame = slot("FRAME", vec![modifiers(vec![(kick, vec![linear(0, 1000, 1.2, 0.8)])])], vec![resource("Aluminum", 0.04, 0, json!([]))]);
+        let barrel = slot(
+            "BARREL:",
+            vec![modifiers(vec![(damage, vec![additive(0, 249, -2, -2), additive(250, 1000, 0, 1), unknown])])],
+            vec![
+                resource("Ouratite", 0.04, 1, json!([{ "_Type_": "CraftingCostContext_QuantityMultiplier", "multiplier": 1.15 }])),
+                json!({ "_Type_": "CraftingCost_Item", "context": [], "entityClass": reference("EntityClassDefinition.harvestable_mineral_1h_hadanite", "hadanite"), "quantity": 7, "minQuality": 500 }),
+            ],
+        );
+        let mandatory = json!({
+            "_Type_": "CraftingCost_Select",
+            "context": [{ "_Type_": "CraftingCostContext_ResultCompositionInclusion", "option": "Include" }],
+            "nameInfo": { "_Type_": "CraftingNameInfo", "debugName": "ASPECTS", "displayName": "@LOC_PLACEHOLDER" },
+            "count": 2,
+            "options": [frame, barrel]
+        });
+        let mut notes = BlueprintNotes::default();
+        let bp = blueprint_from_record("bp-id", "BP_CRAFT_behr_rifle_ballistic_01", &record(mandatory, vec![]), &mut TableReader, &mut notes).expect("a creation blueprint");
+
+        assert_eq!((bp.id.as_str(), bp.name.as_str(), bp.category.as_deref()), ("bp-id", "BP_CRAFT_behr_rifle_ballistic_01", Some("FPSWeapons")));
+        assert_eq!((bp.output_item_id.as_deref(), bp.output_class_name.as_str(), bp.output_name.as_str()), (Some("out"), "behr_rifle_ballistic_01", "behr rifle ballistic 01"));
+        assert_eq!(bp.display_name, None, "a placeholder name is no name");
+        assert_eq!(bp.craft_time_sec, 3750.0);
+        assert_eq!(bp.slots_required, Some(2));
+        assert!(bp.optional_slots.is_empty() && bp.sources.is_empty());
+        assert_eq!(
+            bp.slots[0],
+            BlueprintSlot {
+                name: "Frame".into(),
+                count: 1,
+                options: vec![CraftInput { kind: "resource".into(), item_id: Some("res-Aluminum".into()), class_name: None, name: "Aluminum".into(), qty: 0.04, unit: Unit::Scu, min_quality: 0 }],
+                quantity_multipliers: vec![],
+                quality_effects: vec![QualityEffect {
+                    key: "gpp_weapon_recoil_kick".into(),
+                    name: None,
+                    ranges: vec![QualityRange { kind: QualityRangeKind::Linear, start_quality: 0, end_quality: 1000, at_start: 1.2, at_end: 0.8 }],
+                }],
+            }
+        );
+        let barrel = &bp.slots[1];
+        assert_eq!((barrel.name.as_str(), barrel.count), ("Barrel:", 1));
+        assert_eq!(barrel.options.iter().map(|o| (o.name.as_str(), o.qty, o.unit, o.min_quality)).collect::<Vec<_>>(), [("Ouratite", 0.04, Unit::Scu, 1), ("harvestable_mineral_1h_hadanite", 7.0, Unit::Count, 500)]);
+        assert_eq!(barrel.quantity_multipliers, [QuantityMultiplier { option: Some(0), multiplier: 1.15 }], "the multiplier stays with its option");
+        assert_eq!(
+            barrel.quality_effects,
+            [QualityEffect {
+                key: "gpp_weapon_damage".into(),
+                name: Some("Damage".into()),
+                ranges: vec![
+                    QualityRange { kind: QualityRangeKind::IntegerAdditive, start_quality: 0, end_quality: 249, at_start: -2.0, at_end: -2.0 },
+                    QualityRange { kind: QualityRangeKind::IntegerAdditive, start_quality: 250, end_quality: 1000, at_start: 0.0, at_end: 1.0 },
+                ],
+            }]
+        );
+        assert_eq!(notes, BlueprintNotes { skipped_ranges: 1, ..Default::default() }, "the unknown range type is counted, not guessed");
+    }
+
+    #[test]
+    fn optional_costs_stay_apart_and_odd_shapes_are_counted() {
+        let frame = slot("FRAME", vec![], vec![resource("Aluminum", 0.2, 0, json!([]))]);
+        let paint = slot("PAINT", vec![], vec![resource("Iron", 0.01, 0, json!([]))]);
+        let mut rec = record(frame, vec![paint]);
+        rec["blueprint"]["blueprintName"] = json!("@mission_item_0075");
+        let mut notes = BlueprintNotes::default();
+        let bp = blueprint_from_record("b", "BP_CRAFT_x", &rec, &mut TableReader, &mut notes).expect("a creation blueprint");
+        assert_eq!(bp.slots_required, None, "a single slot is not a group");
+        assert_eq!(bp.slots.iter().map(|slot| slot.name.as_str()).collect::<Vec<_>>(), ["Frame"]);
+        assert_eq!(bp.optional_slots.iter().map(|slot| slot.name.as_str()).collect::<Vec<_>>(), ["Paint"]);
+        assert_eq!(bp.display_name.as_deref(), Some("Microsatellite"));
+        assert_eq!(notes, BlueprintNotes::default());
+
+        // A group inside the root group, carrying a quality effect no slot owns.
+        let inner = json!({
+            "_Type_": "CraftingCost_Select",
+            "context": [modifiers(vec![(reference("CraftingGameplayPropertyRecord.gpp_a", "a"), vec![linear(0, 1000, 1.0, 2.0)])])],
+            "count": 1,
+            "options": [slot("A", vec![], vec![resource("Iron", 1.0, 0, json!([]))])]
+        });
+        let root = json!({ "_Type_": "CraftingCost_Select", "count": 1, "options": [inner] });
+        let mut notes = BlueprintNotes::default();
+        let bp = blueprint_from_record("b", "BP_CRAFT_x", &record(root, vec![]), &mut TableReader, &mut notes).expect("a creation blueprint");
+        assert_eq!((bp.slots.len(), bp.slots_required), (1, Some(1)));
+        assert_eq!(notes, BlueprintNotes { nested_groups: 1, unplaced: 1, ..Default::default() });
+
+        // The game's one dismantle record is not a creation blueprint.
+        let dismantle = json!({ "_Type_": "CraftingBlueprintRecord", "blueprint": { "_Type_": "CraftingBlueprint", "processSpecificData": { "_Type_": "GenericCraftingProcess_Dismantle" }, "tiers": [] } });
+        let mut notes = BlueprintNotes::default();
+        assert!(blueprint_from_record("d", "GlobalGenericDismantle", &dismantle, &mut TableReader, &mut notes).is_none());
+        assert_eq!(notes, BlueprintNotes { not_creation: 1, ..Default::default() });
+
+        // An output class name validation would refuse leaves the blueprint out.
+        let mut rec = record(slot("FRAME", vec![], vec![resource("Iron", 1.0, 0, json!([]))]), vec![]);
+        rec["blueprint"]["processSpecificData"]["entityClass"] = reference("EntityClassDefinition.bad name", "x");
+        let mut notes = BlueprintNotes::default();
+        assert!(blueprint_from_record("b", "BP_CRAFT_x", &rec, &mut TableReader, &mut notes).is_none());
+        assert_eq!(notes, BlueprintNotes { unsafe_names: 1, ..Default::default() });
+        assert_eq!(notes.warnings().len(), 1);
+    }
+
+    #[test]
+    fn pool_shares_are_weights_over_the_pool_total() {
+        let entry = |id: Option<&str>, weight: Option<f64>| {
+            let mut e = json!({ "_Type_": "BlueprintReward", "blueprintRecord": id.map(|id| json!({ "$ref": id, "$name": "CraftingBlueprintRecord.x" })) });
+            if let Some(w) = weight {
+                e["weight"] = json!(w);
+            }
+            e
+        };
+        // Total 7: a 1 + b 3 + an empty entry 1 + a again 1 + c with no weight (1) + d negative (0).
+        let pool = json!({ "blueprintRewards": [
+            entry(Some("a"), Some(1.0)), entry(Some("b"), Some(3.0)), entry(None, Some(1.0)),
+            entry(Some("a"), Some(1.0)), entry(Some("c"), None), entry(Some("d"), Some(-2.0))
+        ] });
+        assert_eq!(pool_shares(&pool), vec![("a".to_string(), 2.0 / 7.0), ("b".to_string(), 3.0 / 7.0), ("c".to_string(), 1.0 / 7.0), ("d".to_string(), 0.0)]);
+        assert!(pool_shares(&json!({ "blueprintRewards": [entry(Some("a"), Some(0.0))] })).is_empty(), "no weight at all");
+        assert!(pool_shares(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn a_source_chance_is_the_result_chance_times_the_share() {
+        assert_eq!(result_chance(None), (1.0, false));
+        assert_eq!(result_chance(Some(0.5)), (0.5, false));
+        assert_eq!(result_chance(Some(1.5)), (1.0, true));
+        assert_eq!(result_chance(Some(-0.1)), (0.0, true));
+        let shares = pool_shares(&json!({ "blueprintRewards": [{ "weight": 1.0, "blueprintRecord": { "$ref": "a" } }, { "weight": 3.0, "blueprintRecord": { "$ref": "b" } }] }));
+        let (chance, _) = result_chance(Some(0.5));
+        assert_eq!(shares.iter().map(|(id, share)| (id.as_str(), chance * share)).collect::<Vec<_>>(), [("a", 0.125), ("b", 0.375)]);
+        // The pool chance is the result's own chance, kept only below 1.
+        assert_eq!(pool_chance(chance), Some(0.5));
+        assert_eq!(pool_chance(0.25), Some(0.25));
+        assert_eq!(pool_chance(0.0), Some(0.0));
+        assert_eq!(pool_chance(result_chance(None).0), None, "a result without chance always gives one");
+        assert_eq!(pool_chance(result_chance(Some(1.5)).0), None, "clamped to 1");
+
+        assert_eq!(result_when(&json!({ "missionResults": [true, false] })), Some("complete"));
+        assert_eq!(result_when(&json!({ "missionResults": [false, true] })), Some("accept"));
+        assert_eq!(result_when(&json!({})), Some("complete"), "no flags: on success, as the Wikelo rewards read it");
+        assert_eq!(result_when(&json!({ "missionResults": [false, false] })), None);
+    }
+
+    #[test]
+    fn property_keys_come_from_the_record_name_or_the_file_name() {
+        let key = |v: Value| property_key(&v);
+        assert_eq!(key(json!({ "$ref": "x", "$name": "CraftingGameplayPropertyRecord.gpp_weapon_recoil_kick", "$path": "a/b.json" })).as_deref(), Some("gpp_weapon_recoil_kick"));
+        assert_eq!(key(json!({ "_RecordName_": "T.gpp_armor_damagemitigation", "_RecordId_": "x" })).as_deref(), Some("gpp_armor_damagemitigation"));
+        assert_eq!(key(json!({ "$ref": "x", "$path": "libs/foundry/records/crafting/craftedproperties/gpp_health_maxhealth.json" })).as_deref(), Some("gpp_health_maxhealth"));
+        assert_eq!(key(json!("file://./../../crafting/craftedproperties/gpp_weapon_firerate.json")).as_deref(), Some("gpp_weapon_firerate"));
+        assert_eq!(key(json!(null)), None);
+        assert_eq!(key(json!({ "$name": " " })), None);
+    }
+
+    #[test]
+    fn a_property_name_is_its_display_name_or_another_name_key() {
+        let loc = Localization::parse(b"gpp_kick=Recoil Kick\r\nui_damage=Damage\r\n");
+        assert_eq!(localized_name(&json!({ "displayName": "@gpp_kick", "propertyName": "@ui_damage" }), &loc).as_deref(), Some("Recoil Kick"));
+        assert_eq!(localized_name(&json!({ "displayName": "@LOC_PLACEHOLDER", "uiName": "@ui_damage" }), &loc).as_deref(), Some("Damage"));
+        assert_eq!(localized_name(&json!({ "displayName": "@missing", "description": "@ui_damage" }), &loc), None, "only fields that say name");
+        assert_eq!(localized_name(&json!({ "name": "ui_damage" }), &loc), None, "a key needs its @");
+    }
+
+    #[test]
+    fn long_text_is_cut_to_what_validation_accepts() {
+        assert_eq!(fit("Frame".into()), "Frame");
+        assert_eq!(fit("é".repeat(201)).chars().count(), 200);
+    }
+
+    // ----- what a blueprint's item is ------------------------------------------------------
+
+    /// A crafted item record laid out like the game's (`COOL_ACOM_S01_IcePlunge_SCItem`): the
+    /// item definition sits in the `SAttachableComponentParams`, after other components.
+    fn item_record(item_type: &str, sub_type: &str, size: i64, grade: i64, manufacturer: Value, description: &str) -> Value {
+        json!({
+            "_Type_": "EntityClassDefinition",
+            "Components": [
+                { "_Type_": "SGeometryResourceParams", "Geometry": {} },
+                { "_Type_": "SAttachableComponentParams", "AttachDef": {
+                    "_Type_": "SItemDefinition", "Type": item_type, "SubType": sub_type, "Size": size, "Grade": grade,
+                    "Manufacturer": manufacturer, "inheritParentManufacturer": false, "Tags": "",
+                    "Localization": { "_Type_": "SCItemLocalization", "Name": "@item_Name", "ShortName": "@LOC_EMPTY", "Description": description }
+                } }
+            ]
+        })
+    }
+
+    fn manufacturer_record(code: &str, name_key: &str) -> Value {
+        json!({ "_Type_": "SCItemManufacturer", "Localization": { "_Type_": "SCItemLocalization", "Name": name_key, "ShortName": "@LOC_EMPTY" }, "Code": code })
+    }
+
+    const COOLER_PATH: &str = "libs/foundry/records/crafting/blueprints/crafting/vehiclecomponents/cooler/bp_craft_cool_acom_s01_iceplunge.json";
+
+    /// A reader that knows the ACOM IcePlunge cooler (the blueprint record's output is `out`).
+    fn cooler_reader() -> RecordReader {
+        let mut reader = RecordReader::default();
+        let acom = reference("SCItemManufacturer.ACOM", "m-acom");
+        reader.records.insert("out".into(), item_record("Cooler", "UNDEFINED", 1, 3, acom, "@item_DescCOOL_ACOM_S01_IcePlunge"));
+        reader.records.insert("m-acom".into(), manufacturer_record("ACOM", "@manufacturer_NameACOM"));
+        reader.texts.insert("@manufacturer_NameACOM".into(), "ACOM".into());
+        reader.texts.insert(
+            "@item_DescCOOL_ACOM_S01_IcePlunge".into(),
+            "Item Type: Cooler\nManufacturer: ACOM\nSize: 1\nGrade: C\nClass: Competition\n\nWhen you're pushing your ship to the limit, you'll be glad you have ACOM's IcePlunge.".into(),
+        );
+        reader
+    }
+
+    /// The test blueprint record read and described with `reader`.
+    fn described(reader: &mut RecordReader, path: &str, defaults: Option<&DefaultBlueprints>) -> (Blueprint, BlueprintNotes) {
+        let rec = record(slot("FRAME", vec![], vec![resource("Iron", 1.0, 0, json!([]))]), vec![]);
+        let mut notes = BlueprintNotes::default();
+        let mut bp = blueprint_from_record("bp-id", "BP_CRAFT_x", &rec, reader, &mut notes).expect("a creation blueprint");
+        describe_blueprint_item(&mut bp, &rec, path, defaults, reader, &mut notes);
+        (bp, notes)
+    }
+
+    #[test]
+    fn a_blueprint_says_what_its_item_is() {
+        let (bp, notes) = described(&mut cooler_reader(), COOLER_PATH, None);
+        assert_eq!(bp.item_type.as_deref(), Some("Cooler"));
+        assert_eq!(bp.item_sub_type, None, "UNDEFINED is no sub type");
+        assert_eq!((bp.size, bp.grade), (Some(1), Some(3)));
+        assert_eq!(bp.manufacturer, Some(BlueprintManufacturer { code: "ACOM".into(), name: "ACOM".into() }));
+        assert_eq!(bp.item_class.as_deref(), Some("Competition"));
+        assert_eq!(bp.tags, ["vehiclecomponents", "cooler"]);
+        assert!(!bp.default, "no default list");
+        assert_eq!(notes, BlueprintNotes::default(), "UNDEFINED sub type and no default list are not misses here");
+
+        // A sub type the game fills in is kept; the rest of the item reads the same.
+        let mut reader = cooler_reader();
+        reader.records.insert("out".into(), item_record("WeaponAttachment", "Magazine", 1, 1, json!(null), "@item_Descbehr_lmg_ballistic_01_mag"));
+        reader.texts.insert("@item_Descbehr_lmg_ballistic_01_mag".into(), "Item Type: Magazine\nCapacity: 75\n\nThis magazine for the Behring FS-9 LMG holds seventy five 5mm rounds.".into());
+        let (bp, notes) = described(&mut reader, "libs/foundry/records/crafting/blueprints/crafting/fpsgear/ammo/ballistic/bp_craft_behr_lmg_ballistic_01_mag.json", None);
+        assert_eq!((bp.item_type.as_deref(), bp.item_sub_type.as_deref()), (Some("WeaponAttachment"), Some("Magazine")));
+        assert_eq!((bp.manufacturer, bp.item_class), (None, None), "no manufacturer and no Class: line");
+        assert_eq!(bp.tags, ["fpsgear", "ammo", "ballistic"]);
+        assert_eq!(notes, BlueprintNotes::default(), "an item without a manufacturer or a class is not a miss");
+    }
+
+    #[test]
+    fn what_cannot_be_read_about_the_item_is_left_out_and_counted() {
+        // The item record does not resolve: nothing about the item, the path still gives tags.
+        let (bp, notes) = described(&mut RecordReader::default(), COOLER_PATH, None);
+        assert_eq!((bp.item_type, bp.size, bp.grade, bp.manufacturer), (None, None, None, None));
+        assert_eq!(bp.tags, ["vehiclecomponents", "cooler"]);
+        assert_eq!(notes, BlueprintNotes { no_item_record: 1, ..Default::default() });
+
+        // An item without an item definition.
+        let mut reader = RecordReader::default();
+        reader.records.insert("out".into(), json!({ "_Type_": "EntityClassDefinition", "Components": [{ "_Type_": "SGeometryResourceParams" }] }));
+        let (bp, notes) = described(&mut reader, COOLER_PATH, None);
+        assert_eq!(bp.item_type, None);
+        assert_eq!(notes, BlueprintNotes { no_item_definition: 1, ..Default::default() });
+
+        // UNDEFINED type, size past 12, grade 0, a manufacturer that does not resolve.
+        let mut reader = cooler_reader();
+        reader.records.insert("out".into(), item_record("UNDEFINED", "Gun", 13, 0, reference("SCItemManufacturer.GONE", "m-gone"), "@item_DescCOOL_ACOM_S01_IcePlunge"));
+        let (bp, notes) = described(&mut reader, COOLER_PATH, None);
+        assert_eq!((bp.item_type, bp.item_sub_type.as_deref(), bp.size, bp.grade, bp.manufacturer), (None, Some("Gun"), None, None, None));
+        assert_eq!(bp.item_class.as_deref(), Some("Competition"), "the rest is still read");
+        assert_eq!(notes, BlueprintNotes { no_item_type: 1, no_size: 1, no_grade: 1, unresolved_manufacturers: 1, ..Default::default() });
+        assert_eq!(notes.warnings().len(), 4, "one line per kind of miss: {:?}", notes.warnings());
+
+        // A type validation would refuse, and a manufacturer whose name is a placeholder.
+        let mut reader = cooler_reader();
+        reader.records.insert("m-acom".into(), manufacturer_record("ACOM", "@LOC_PLACEHOLDER"));
+        reader.records.insert("out".into(), item_record(&"X".repeat(MAX_BLUEPRINT_LABEL + 1), "UNDEFINED", 1, 3, reference("SCItemManufacturer.ACOM", "m-acom"), "@none"));
+        let (bp, notes) = described(&mut reader, COOLER_PATH, None);
+        assert_eq!((bp.item_type, bp.manufacturer, bp.item_class), (None, None, None));
+        assert_eq!(notes, BlueprintNotes { unusable_labels: 1, unnamed_manufacturers: 1, ..Default::default() });
+
+        // The path is not under blueprints/crafting/.
+        let (bp, notes) = described(&mut cooler_reader(), "libs/foundry/records/crafting/blueprints/dismantle/x.json", None);
+        assert!(bp.tags.is_empty());
+        assert_eq!(notes, BlueprintNotes { no_tag_folder: 1, ..Default::default() });
+    }
+
+    #[test]
+    fn a_missing_manufacturer_is_none_without_a_miss() {
+        let mut notes = BlueprintNotes::default();
+        let mut reader = cooler_reader();
+        for none in [json!(null), json!(""), json!({ "$ref": "00000000-0000-0000-0000-000000000000", "$name": "", "$path": "" })] {
+            assert_eq!(item_manufacturer(Some(&none), &mut reader, &mut notes), None, "{none}");
+        }
+        assert_eq!(item_manufacturer(None, &mut reader, &mut notes), None);
+        assert_eq!(notes, BlueprintNotes::default());
+
+        let acom = reference("SCItemManufacturer.ACOM", "m-acom");
+        assert_eq!(item_manufacturer(Some(&acom), &mut reader, &mut notes), Some(BlueprintManufacturer { code: "ACOM".into(), name: "ACOM".into() }));
+        // A code with nothing in it, or past the limit, is no code.
+        let long = "A".repeat(MAX_MANUFACTURER_CODE + 1);
+        for code in [" ", long.as_str()] {
+            reader.records.insert("m-acom".into(), manufacturer_record(code, "@manufacturer_NameACOM"));
+            assert_eq!(item_manufacturer(Some(&acom), &mut reader, &mut notes), None, "{code:?}");
+        }
+        assert_eq!(notes, BlueprintNotes { unnamed_manufacturers: 2, ..Default::default() });
+    }
+
+    #[test]
+    fn the_class_is_the_class_line_of_the_description_header() {
+        // Where the cooler has it: after the other header lines.
+        assert_eq!(description_class("Item Type: Cooler\nManufacturer: ACOM\nSize: 1\nGrade: C\nClass: Competition\n\nWhen you're pushing..."), Some("Competition"));
+        // First, or with odd spacing and case.
+        assert_eq!(description_class("Class: Military\nItem Type: Quantum Drive\n\nText."), Some("Military"));
+        assert_eq!(description_class("Manufacturer: Wei-Tek\r\n  class :  Stealth  \r\n\r\nText."), Some("Stealth"));
+        // A leading blank line does not hide the header.
+        assert_eq!(description_class("\nItem Type: Shield Generator\nClass: Industrial"), Some("Industrial"));
+        // Absent: a header without it (the laser cannon starts with its manufacturer), a
+        // `Class:` in the prose, an empty value, another key.
+        assert_eq!(description_class("Manufacturer: Amon & Reese Co.\nItem Type: Laser Cannon\nSize: 1\n\nThe Omnisky III is the base model."), None);
+        assert_eq!(description_class("Item Type: Magazine\nCapacity: 75\n\nClass: in the prose is not a header line"), None);
+        assert_eq!(description_class("Class:\nSize: 1"), None);
+        assert_eq!(description_class("Classification: Civilian"), None);
+        assert_eq!(description_class(""), None);
+    }
+
+    #[test]
+    fn undefined_or_empty_labels_are_none() {
+        let mut notes = BlueprintNotes::default();
+        assert_eq!(item_label(Some("UNDEFINED"), &mut notes), None);
+        assert_eq!(item_label(Some("undefined"), &mut notes), None);
+        assert_eq!(item_label(Some("  "), &mut notes), None);
+        assert_eq!(item_label(None, &mut notes), None);
+        assert_eq!(item_label(Some(" Medium "), &mut notes).as_deref(), Some("Medium"));
+        assert_eq!(notes, BlueprintNotes::default());
+        assert_eq!(item_label(Some("a\u{1}b"), &mut notes), None);
+        assert_eq!(notes, BlueprintNotes { unusable_labels: 1, ..Default::default() });
+    }
+
+    #[test]
+    fn tags_are_the_folders_after_blueprints_crafting() {
+        let tags = |path: &str| blueprint_tags(path).map(|(t, dropped)| (t.join(","), dropped));
+        let owned = |t: &str, dropped: usize| Some((t.to_string(), dropped));
+        assert_eq!(tags("libs/foundry/records/crafting/blueprints/crafting/fpsgear/ammo/ballistic/bp_craft_behr_rifle_ballistic_01_mag.json"), owned("fpsgear,ammo,ballistic", 0));
+        assert_eq!(tags(r"Libs\Foundry\Records\Crafting\Blueprints\Crafting\FPSGear\Armour\Combat\Light\BP_CRAFT_cds_armor_light_helmet_01_01_01.json"), owned("fpsgear,armour,combat,light", 0), "Windows separators and upper case");
+        assert_eq!(tags("file://./../../../../../libs/foundry/records/crafting/blueprints/crafting/fpsgear/weapons/rifle/bp_craft_behr_rifle_ballistic_01.json"), owned("fpsgear,weapons,rifle", 0), "a reference's path");
+        assert_eq!(tags(r"libs/foundry\records/crafting\blueprints/crafting\fpsgear/weapons\bp.json"), owned("fpsgear,weapons", 0), "mixed separators");
+        assert_eq!(tags("blueprints/crafting/fpsgear/bp.json"), owned("fpsgear", 0), "the path starts there");
+        assert_eq!(tags("libs/foundry/records/crafting/blueprints/crafting/bp.json"), owned("", 0), "no folder: no tag, no miss");
+        assert_eq!(tags("libs/foundry/records/crafting/blueprints/crafting//fpsgear/bp.json"), owned("fpsgear", 0), "an empty segment is no folder");
+        assert_eq!(tags("blueprints/crafting/a/b/c/d/e/f/g/bp.json"), owned("a,b,c,d,e,f", 1), "six at most");
+        assert_eq!(tags("blueprints/crafting/fps gear/weapons/../bp.json"), owned("weapons", 2), "folders a tag cannot carry");
+        assert_eq!(tags("libs/foundry/records/crafting/blueprints/dismantle/globalgenericdismantle.json"), None);
+        assert_eq!(tags("libs/foundry/records/crafting/myblueprints/crafting/x/bp.json"), None, "a whole folder name");
+        assert_eq!(tags(""), None);
+    }
+
+    #[test]
+    fn the_default_list_is_read_by_id_or_by_path() {
+        let params = json!({
+            "_Type_": "CraftingGlobalParams",
+            "defaultBlueprintSelection": { "_Type_": "DefaultBlueprintSelection_Whitelist", "blueprintRecords": [
+                "file://./../../../../../libs/foundry/records/crafting/blueprints/dismantle/globalgenericdismantle.json",
+                "file://./../../../../../libs/foundry/records/crafting/blueprints/crafting/fpsgear/weapons/rifle/bp_craft_behr_rifle_ballistic_01.json",
+                { "$ref": "bp-pistol", "$name": "CraftingBlueprintRecord.BP_CRAFT_behr_pistol_ballistic_01", "$path": "libs/foundry/records/crafting/blueprints/crafting/fpsgear/weapons/pistol/bp_craft_behr_pistol_ballistic_01.json" },
+                null
+            ] }
+        });
+        let list = default_blueprint_list(&params).expect("a list");
+        assert_eq!(list.ids, HashSet::from(["bp-pistol".to_string()]));
+        assert_eq!(list.paths.len(), 3);
+        assert!(list.contains("some-id", r"Libs\Foundry\Records\Crafting\Blueprints\Crafting\FPSGear\Weapons\Rifle\BP_CRAFT_behr_rifle_ballistic_01.json"), "by path");
+        assert!(list.contains("bp-pistol", "somewhere/else.json"), "by id");
+        assert!(!list.contains("other", "libs/foundry/records/crafting/blueprints/crafting/fpsgear/weapons/rifle/bp_craft_other.json"));
+        assert!(!list.contains("other", ""));
+        assert_eq!(default_blueprint_list(&json!({ "defaultBlueprintSelection": { "_Type_": "DefaultBlueprintSelection_All" } })), None, "another kind of selection");
+        assert_eq!(default_blueprint_list(&json!({ "defaultBlueprintSelection": null })), None);
+        assert_eq!(default_blueprint_list(&json!({})), None);
+
+        // On a blueprint: by its record id, by its path, and not without a list.
+        let by_id = DefaultBlueprints { ids: HashSet::from(["bp-id".to_string()]), paths: HashSet::new() };
+        assert!(described(&mut cooler_reader(), COOLER_PATH, Some(&by_id)).0.default);
+        let by_path = DefaultBlueprints { ids: HashSet::new(), paths: blueprint_path_key(COOLER_PATH).into_iter().collect() };
+        assert!(described(&mut cooler_reader(), COOLER_PATH, Some(&by_path)).0.default);
+        assert!(!described(&mut cooler_reader(), COOLER_PATH, Some(&DefaultBlueprints::default())).0.default);
+        assert!(!described(&mut cooler_reader(), COOLER_PATH, None).0.default);
+    }
+
+    #[test]
+    fn the_item_fields_reach_the_json_only_when_known() {
+        let (bp, _) = described(&mut cooler_reader(), COOLER_PATH, None);
+        let json = serde_json::to_value(&bp).unwrap();
+        assert_eq!(json["itemType"], "Cooler");
+        assert_eq!(json["manufacturer"], json!({ "code": "ACOM", "name": "ACOM" }));
+        assert_eq!(json["itemClass"], "Competition");
+        assert_eq!(json["tags"], json!(["vehiclecomponents", "cooler"]));
+        assert_eq!((json["size"].clone(), json["grade"].clone()), (json!(1), json!(3)));
+        assert!(json.get("itemSubType").is_none() && json.get("default").is_none(), "{json}");
     }
 }
 
@@ -1656,5 +3190,87 @@ mod tests {
         // Exactly at the limit (the star is the 32nd ancestor) still reaches the system.
         let at_limit = climb_star_map(&format!("d{}", MAX_MAP_DEPTH - 1), &nodes);
         assert_eq!((at_limit.system.as_deref(), at_limit.problem), (Some("Nyx"), None));
+    }
+}
+
+#[cfg(test)]
+mod quality_tier_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// `_RecordValue_` of `CraftingQualityQuantizationRecord.Quantization_Agricium` as the game has it.
+    fn agricium() -> Value {
+        let band = |start: i64, end: i64, mapped: i64| json!({ "_Type_": "CraftingQualityQuantizationBand", "start": start, "end": end, "mappedValue": mapped });
+        json!({
+            "_Type_": "CraftingQualityQuantizationRecord",
+            "qualityQuantization": {
+                "_Type_": "CraftingQualityQuantization",
+                "bands": [
+                    band(0, 399, 346), band(400, 599, 588), band(600, 699, 667), band(700, 799, 796),
+                    band(800, 899, 852), band(900, 949, 943), band(950, 998, 971), band(999, 1000, 1000)
+                ]
+            }
+        })
+    }
+
+    #[test]
+    fn bands_are_read_from_the_record() {
+        let bands = quality_bands(&agricium()).expect("the game's record reads");
+        assert_eq!(bands.len(), 8);
+        assert_eq!(bands[0], QualityBand { start: 0, end: 399, value: 346 });
+        assert_eq!(bands[5], QualityBand { start: 900, end: 949, value: 943 });
+        assert_eq!(bands[7], QualityBand { start: 999, end: 1000, value: 1000 });
+
+        // Listed out of order: sorted.
+        let mut shuffled = agricium();
+        shuffled["qualityQuantization"]["bands"].as_array_mut().unwrap().reverse();
+        assert_eq!(quality_bands(&shuffled), Some(bands));
+    }
+
+    #[test]
+    fn unusable_bands_leave_the_record_out() {
+        let with = |change: &dyn Fn(&mut Value)| {
+            let mut v = agricium();
+            change(&mut v);
+            quality_bands(&v)
+        };
+        assert_eq!(
+            with(&|v| {
+                v["qualityQuantization"]["bands"][2].as_object_mut().unwrap().remove("mappedValue");
+            }),
+            None,
+            "a band without a value"
+        );
+        assert_eq!(with(&|v| v["qualityQuantization"]["bands"][0]["start"] = json!("zero")), None, "a start that is no number");
+        assert_eq!(with(&|v| v["qualityQuantization"]["bands"][7]["end"] = json!(1001)), None, "above the scale");
+        assert_eq!(with(&|v| v["qualityQuantization"]["bands"][0]["mappedValue"] = json!(-1)), None, "a negative value");
+        assert_eq!(with(&|v| v["qualityQuantization"]["bands"][1]["start"] = json!(399)), None, "overlapping bands");
+        assert_eq!(with(&|v| v["qualityQuantization"]["bands"][3]["end"] = json!(650)), None, "an inverted band");
+        assert_eq!(with(&|v| v["qualityQuantization"]["bands"] = json!([])), None, "no band");
+        assert_eq!(with(&|v| *v = json!({ "_Type_": "CraftingQualityQuantizationRecord" })), None, "no quantization");
+    }
+
+    #[test]
+    fn a_material_is_named_after_the_resources_that_use_its_record() {
+        let slots: HashSet<&str> = ["Agricium", "Iron"].into_iter().collect();
+        // A name the blueprint slots use wins, whether refined or not.
+        assert_eq!(pick_tier_name("Agricium", &["Agricium"], &["Agricium (Ore)"], None, &slots), ("Agricium".to_string(), TierLink::Reference));
+        assert_eq!(pick_tier_name("Iron", &["Refined Iron"], &["Iron"], None, &slots), ("Iron".to_string(), TierLink::Reference));
+        // Otherwise the refined resource, then the resource itself.
+        assert_eq!(pick_tier_name("Gold", &["Gold"], &["Gold (Ore)"], Some("Golden"), &slots), ("Gold".to_string(), TierLink::Reference));
+        assert_eq!(pick_tier_name("JumpingLimes", &[], &["Jumping Limes"], None, &slots), ("Jumping Limes".to_string(), TierLink::Reference));
+        // Nobody points at the record: the resource with the same record name, then the key.
+        assert_eq!(pick_tier_name("Tin", &[], &[], Some("Tin"), &slots), ("Tin".to_string(), TierLink::RecordName));
+        assert_eq!(pick_tier_name("HeartOfTheWoods", &[], &[], None, &slots), ("Heart Of The Woods".to_string(), TierLink::Key));
+    }
+
+    #[test]
+    fn keys_split_into_words() {
+        assert_eq!(words_of_key("JumpingLimes"), "Jumping Limes");
+        assert_eq!(words_of_key("Agricium"), "Agricium");
+        assert_eq!(words_of_key("VLKFang"), "VLK Fang");
+        assert_eq!(words_of_key("TEMPLATE"), "TEMPLATE");
+        assert_eq!(words_of_key("Quasi2Egg"), "Quasi2 Egg");
+        assert_eq!(words_of_key(""), "");
     }
 }

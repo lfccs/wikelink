@@ -30,6 +30,13 @@ struct Link {
 /// sorted by id.
 pub fn load_missions(res: &mut RefResolver, loc: &Localization, rewards: &[MissionReward], drops: &[MissionDrop], warnings: &mut Vec<String>) -> Vec<MissionInfo> {
     let wanted: HashSet<&str> = rewards.iter().map(|r| r.contract_id.as_str()).chain(drops.iter().map(|d| d.contract_id.as_str())).collect();
+    describe_missions(res, loc, &wanted, true, warnings)
+}
+
+/// The face of every contract in `wanted`, in any generator (Wikelo's included), sorted by id;
+/// with `follow_chains`, also of the missions that must be completed before them, as deep as
+/// the chains go.
+pub fn describe_missions(res: &mut RefResolver, loc: &Localization, wanted: &HashSet<&str>, follow_chains: bool, warnings: &mut Vec<String>) -> Vec<MissionInfo> {
     if wanted.is_empty() {
         return Vec::new();
     }
@@ -79,11 +86,13 @@ pub fn load_missions(res: &mut RefResolver, loc: &Localization, rewards: &[Missi
     // The missions to describe: the ones named, plus whatever must be completed before them, as
     // deep as the chains go.
     let mut closure: HashSet<String> = wanted.iter().map(|id| id.to_string()).collect();
-    let mut queue: Vec<String> = closure.iter().cloned().collect();
-    while let Some(id) = queue.pop() {
-        for other in unlockers(&id) {
-            if closure.insert(other.clone()) {
-                queue.push(other);
+    if follow_chains {
+        let mut queue: Vec<String> = closure.iter().cloned().collect();
+        while let Some(id) = queue.pop() {
+            for other in unlockers(&id) {
+                if closure.insert(other.clone()) {
+                    queue.push(other);
+                }
             }
         }
     }

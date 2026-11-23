@@ -107,6 +107,45 @@ impl LogEvent {
     }
 }
 
+/// Longest blueprint name kept from a log line, in characters; a longer one is ignored.
+pub const BLUEPRINT_NAME_MAX: usize = 200;
+
+/// Whether `c` is a Unicode format character (general category Cf: soft hyphen, zero-width
+/// spaces and joiners, bidirectional marks and overrides, the byte order mark, tag
+/// characters…). The list follows Unicode 15.1; no crate is used for it.
+pub fn is_format_char(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x00AD
+            | 0x0600..=0x0605
+            | 0x061C
+            | 0x06DD
+            | 0x070F
+            | 0x0890..=0x0891
+            | 0x08E2
+            | 0x180E
+            | 0x200B..=0x200F
+            | 0x202A..=0x202E
+            | 0x2060..=0x2064
+            | 0x2066..=0x206F
+            | 0xFEFF
+            | 0xFFF9..=0xFFFB
+            | 0x110BD
+            | 0x110CD
+            | 0x13430..=0x1343F
+            | 0x1BCA0..=0x1BCA3
+            | 0x1D173..=0x1D17A
+            | 0xE0001
+            | 0xE0020..=0xE007F
+    )
+}
+
+/// Whether `name` (already trimmed) is kept as a blueprint name: not empty, at most
+/// [`BLUEPRINT_NAME_MAX`] characters, and without control or format characters.
+pub fn is_blueprint_name(name: &str) -> bool {
+    !name.is_empty() && name.chars().count() <= BLUEPRINT_NAME_MAX && !name.chars().any(|c| c.is_control() || is_format_char(c))
+}
+
 /// Leading `<2026-10-12T18:44:32.784Z>` timestamp of a log line.
 pub fn timestamp_of(line: &str) -> Option<&str> {
     let rest = line.strip_prefix('<')?;
@@ -153,7 +192,9 @@ impl LineParser {
             objective_id: rx(r"^d_(?P<hash>\d+)_(?P<item>[0-9a-fA-F-]{36})_\d+_\d+$"),
             objective_state: rx(r"<ObjectiveUpserted> .*?mission_id (?P<mid>[0-9a-fA-F-]{36}) - objective_id (?P<obj>\S+) - state (?P<state>MISSION_OBJECTIVE_STATE_\w+)"),
             end_mission: rx(r"<EndMission> Ending mission for player\. MissionId\[(?P<mid>[0-9a-fA-F-]{36})\] Player\[(?P<nick>[^\]]*)\] PlayerId\[(?P<pid>\d*)\] CompletionType\[(?P<ct>\w+)\] Reason\[(?P<reason>[^\]]*)\]"),
-            blueprint: rx(r#"Added notification "Received Blueprint:\s*(?P<name>.*?):?\s*"\s*\[\d+\]"#),
+            // Anchored: the line starts with its timestamp and this notification, so the same
+            // words elsewhere in a line (inside another message) never count.
+            blueprint: rx(r#"^<[^<>]+> \[Notice\] <SHUDEvent_OnNotification> Added notification "Received Blueprint: (?P<name>.*?):?\s*"\s*\[\d+\]"#),
             at_emporium: rx(r"<RequestLocationInventory> Player\[(?P<nick>[^\]]+)\] requested inventory for Location\[(?P<loc>TheCollector[A-Za-z]*_Stanton\d+)\]"),
             at_location: rx(r"<RequestLocationInventory> Player\[(?P<nick>[^\]]+)\] requested inventory for Location\[(?P<loc>[A-Za-z0-9_.-]{1,128})\]"),
             item_moved: rx(r"<Add Inventory Management Move> New Request\[\d+\] Player\[(?P<nick>[^\]]+)\] Type\[(?P<ty>\w+)\] SourceInventory\[(?P<src>[^\]]*)\] TargetInventory\[(?P<dst>[^\]]*)\] ItemClass\[(?P<class>[^\]]*)\]"),
@@ -228,10 +269,16 @@ impl LineParser {
         {
             return Some(LogEvent::MissionAccepted { at, mission_id: c["mid"].to_string(), title: c["title"].trim().to_string() });
         }
-        if line.contains("Received Blueprint:") && line.contains("<SHUDEvent_OnNotification>")
+        if line.contains("Received Blueprint:") && line.contains("<SHUDEvent_OnNotification>") && !at.is_empty()
             && let Some(c) = self.blueprint.captures(line)
         {
-            return Some(LogEvent::BlueprintReceived { at, name: c["name"].trim().to_string() });
+            // A name that is empty, too long or carries control or format characters is not
+            // one the game shows: the line is ignored.
+            let name = c["name"].trim();
+            if !is_blueprint_name(name) {
+                return None;
+            }
+            return Some(LogEvent::BlueprintReceived { at, name: name.to_string() });
         }
         if line.contains("<ObjectiveUpserted>")
             && let Some(c) = self.objective_state.captures(line)
@@ -365,6 +412,43 @@ mod tests {
             p.parse(BLUEPRINT).unwrap(),
             LogEvent::BlueprintReceived { at: "2026-06-01T12:00:00.000Z".into(), name: "Monde Arms Hemlock Camo".into() }
         );
+    }
+
+    #[test]
+    fn a_blueprint_line_must_start_with_its_timestamp_and_the_notification() {
+        let p = LineParser::new();
+        let rest = BLUEPRINT.split_once("> ").unwrap().1;
+        // The same words later in another line, or without the leading timestamp: no event.
+        assert!(p.parse(rest).is_none(), "no timestamp");
+        assert!(p.parse(&format!("  {BLUEPRINT}")).is_none(), "not at the start");
+        assert!(p.parse(&format!("<2026-06-01T12:00:00.000Z> [Notice] <Other> said: {rest}")).is_none(), "inside another message");
+        assert!(p.parse(&BLUEPRINT.replace("[Notice]", "[Warning]")).is_none());
+        assert!(p.parse(&BLUEPRINT.replace("<2026-06-01T12:00:00.000Z>", "<not a time>")).is_none(), "a timestamp that is not one");
+        // A trailing CR (a Windows line end) is still the same line.
+        assert!(matches!(p.parse(&format!("{BLUEPRINT}\r\n")), Some(LogEvent::BlueprintReceived { .. })));
+    }
+
+    #[test]
+    fn blueprint_names_are_bounded_and_plain() {
+        let p = LineParser::new();
+        let with = |name: &str| BLUEPRINT.replace("Monde Arms Hemlock Camo", name);
+        let name_of = |line: &str| match p.parse(line) {
+            Some(LogEvent::BlueprintReceived { name, .. }) => Some(name),
+            Some(other) => panic!("unexpected {other:?}"),
+            None => None,
+        };
+        let longest = "a".repeat(BLUEPRINT_NAME_MAX);
+        assert_eq!(name_of(&with(&longest)), Some(longest.clone()), "200 characters is fine");
+        // Counted in characters, not bytes.
+        let accented = "é".repeat(BLUEPRINT_NAME_MAX);
+        assert_eq!(name_of(&with(&accented)), Some(accented.clone()));
+        assert_eq!(name_of(&with(&"a".repeat(BLUEPRINT_NAME_MAX + 1))), None, "too long");
+        assert_eq!(name_of(&with("   ")), None, "empty after trimming");
+        assert_eq!(name_of(&with("  Padded  ")), Some("Padded".into()));
+        for bad in ["Evil\u{202E}gpj", "Zero\u{200B}Width", "Bell\u{7}", "Tab\tName", "Esc\u{1b}[31m", "Bom\u{FEFF}", "Soft\u{AD}Hyphen", "Tag\u{E0041}"] {
+            assert_eq!(name_of(&with(bad)), None, "{bad:?}");
+        }
+        assert!(is_format_char('\u{202E}') && is_format_char('\u{200B}') && !is_format_char('a') && !is_format_char('\u{FFFD}'));
     }
 
     #[test]

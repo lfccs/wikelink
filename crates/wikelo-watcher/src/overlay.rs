@@ -1,7 +1,20 @@
 //! The in-game overlay (`wikelink overlay`), after the idea of Discord's game
 //! overlay: one transparent, always-on-top window over the whole monitor the game is on,
 //! with the Wikelist cards drawn inside it ("Fixados", "Falta", "Aqui", "Registros",
-//! "Missões").
+//! "Missões", and "Blueprints", drawn only while open and shown or hidden by its button in the
+//! bar: how many of the channel's blueprints the account has, a search field and a filter of
+//! its own (Todas / Adquiridas / Não adquiridas), and every blueprint of the index by name,
+//! each row saying first whether the account has it; a click on a name opens its craft, from
+//! `GET .../overlay/blueprint/{blueprint}`: what the server says of the crafted item (type,
+//! size, grade, class, manufacturer), per slot the material in use with what the player has
+//! against what one craft needs and a quality control, and what the crafted item gets,
+//! computed here with `wikelo_core::craft`; "Onde conseguir" shows the missions that give it
+//! (no percentage: every blueprint of a pool has the same odds and none is given twice; only
+//! a reward that does not always give one says so), "não disponível" one nothing gives; a
+//! mission opens its pools, from `GET .../overlay/mission/{contract}/blueprints`, each with
+//! how many of its blueprints the account has and the blueprints themselves, each opening its
+//! craft. The card's screens form a stack: "Voltar" always returns to the previous one.
+//! Nothing about blueprints is pinned).
 //!
 //! Closed (the normal state while playing) the window ignores the mouse and never takes the
 //! focus: only the cards the player pinned ("fixar na tela") are drawn, at their places and
@@ -9,10 +22,12 @@
 //! a change of location, a few seconds each, while "Alertas" is on in the widgets menu), a
 //! reward waiting to be chosen, and the overlay's own warnings.
 //! Shift+Tab opens it: a dark scrim over the screen, every card (dragged by its header,
-//! resized by its lower-right corner), the reward choices waiting, a bar with the channel,
-//! the location, the opacity, the text size, the widgets menu (a switch per card, for the
-//! search and for the alerts; "mostrar todos" / "ocultar todos"; a card or the search
-//! switched off is not drawn open or closed, its pin kept) and "Ocultar" (hides everything,
+//! resized by its lower-right corner, hidden by the ✕ of its header), the reward choices
+//! waiting, a bar with the channel, the location, the opacity, the text size (the bar and the
+//! cards' headers grow with it too), the blueprints card's button, the widgets menu (a switch
+//! per card but the blueprints one, for the search and for the alerts; "mostrar todos" /
+//! "ocultar todos"; a card or the search switched off is not drawn open or closed, its pin
+//! kept) and "Ocultar" (hides everything,
 //! as Alt+Shift+F9 does; the process stays, and the hotkey or the tray icon's "Mostrar o
 //! overlay" brings it back: nothing in the overlay ends its process), and the search strip:
 //! right under the bar until dragged elsewhere by its grip, one big field (Ctrl+F). Once
@@ -22,7 +37,8 @@
 //! each with what the player has (from `GET /api/inventory`, 0 for an item it does not list,
 //! no number before it answered: read while the overlay is open, every
 //! [`widgets::INVENTORY_EVERY`] and after a write settles), then "Missões". The index
-//! (`GET .../overlay/index`) is searched on this machine, fetched once and revalidated with its
+//! (`GET .../overlay/index`, also the blueprints card's list) is searched on this machine,
+//! fetched once and revalidated with its
 //! ETag at most every [`INDEX_REVALIDATE`]; an older server without it is searched per query.
 //! The results unfold under the strip (above it when there is more room there), over the
 //! cards, as tall as they are up to the edge of the screen; an empty field shows nothing.
@@ -87,7 +103,7 @@ use crate::overlay_game::{self, Life};
 use crate::overlay_log;
 use crate::overlay_model::{self as model, Local, OverlayData, OverlayIndex};
 use crate::overlay_sync::{self as sync, Job, Limit, Outcome, WriteEffect, WriteResult};
-use crate::overlay_widgets::{self as widgets, CardPlace, EscStep, Filter, Group, InventoryFetch, Layout, Listing, LocationsFetch, Part, Search, SearchAnswer, Shown, Toast, Toasts, Widget};
+use crate::overlay_widgets::{self as widgets, BpPanel, BpScreen, CardPlace, DetailAnswer, DetailFetch, EscStep, Filter, Group, InventoryFetch, Layout, Listing, LocationsFetch, MissionAnswer, MissionFetch, Part, ScreenStack, Search, SearchAnswer, Shown, Toast, Toasts, Widget};
 use crate::overlay_win::{self as os, Monitor, PrevFocus, Window};
 use crate::palette::{ACCENT, BORDER, BRASS, FIELD, FIELD_BORDER, FIELD_HINT, MUTED, NAVY, OK, TEXT, TEXT_BRIGHT, WARN};
 use crate::{tr, trf};
@@ -151,6 +167,12 @@ fn busy_hint() -> &'static str {
 fn moving_hint() -> &'static str {
     tr!("wait: moving", "aguarde: movendo")
 }
+/// The blueprints card when the site sends no list (an older server).
+fn no_blueprint_list() -> &'static str {
+    tr!("The site has no blueprint list yet.", "O site ainda não tem a lista de blueprints.")
+}
+/// Width of a blueprint row's first cell (acquired or not), before the text size.
+const BP_STATE_WIDTH: f32 = 112.0;
 /// Width of the move picker, before the text size.
 const MOVER_WIDTH: f32 = 300.0;
 /// Hover text of "Hide": what it does and how the overlay comes back.
@@ -199,6 +221,11 @@ const SEARCH_FIELD_TEXT: f32 = 1.35;
 /// The search field, for the keyboard focus (Ctrl+F, Esc).
 fn search_id() -> egui::Id {
     egui::Id::new("wikelist-search")
+}
+
+/// The blueprints card's search field (Esc empties it).
+fn bp_search_id() -> egui::Id {
+    egui::Id::new("wikelist-bp-search")
 }
 
 /// The area of the search strip.
@@ -258,6 +285,9 @@ struct Reply {
     what: Answer,
 }
 
+// One of these crosses a channel every few seconds and is taken apart at once: boxing the
+// read would only add an allocation per answer.
+#[allow(clippy::large_enum_variant)]
 enum Answer {
     Read(ReadAnswer),
     /// What became of the write of change `id`.
@@ -269,6 +299,10 @@ enum Answer {
     Inventory(u64, Result<HashMap<String, model::Owned>, String>, Option<Limit>),
     /// The channel's locations, and whether it was a 429.
     Locations(Result<Vec<model::Location>, String>, Option<Limit>),
+    /// The detail of the blueprint with this key.
+    Detail(String, DetailAnswer),
+    /// The blueprints of the mission with this contract id.
+    Mission(String, MissionAnswer),
 }
 
 /// What a request for the search index got.
@@ -529,6 +563,14 @@ fn data_thread(rx: Receiver<Cmd>, tx: Sender<Reply>, ctx: egui::Context) {
                 let (answer, limit) = fetch_locations(&c, &channel);
                 Answer::Locations(answer, limit)
             }
+            Job::Detail(key) => {
+                let answer = fetch_detail(&c, &channel, &key, etag);
+                Answer::Detail(key, answer)
+            }
+            Job::Mission(contract) => {
+                let answer = fetch_mission(&c, &channel, &contract, etag);
+                Answer::Mission(contract, answer)
+            }
         };
         if tx.send(Reply { generation, what }).is_err() {
             return;
@@ -726,6 +768,84 @@ fn index_answer(status: u16, body: &[u8], etag_sent: bool, etag: Option<String>,
     }
 }
 
+/// The path of a blueprint's detail: the channel and the blueprint's key percent-encoded, like
+/// every path segment.
+fn detail_path(channel: &str, blueprint: &str) -> String {
+    format!("/api/channels/{}/overlay/blueprint/{}", model::path_segment(channel), model::path_segment(blueprint))
+}
+
+/// Read one blueprint's detail (`etag`: of the detail held, sent as `If-None-Match`). A key
+/// the route does not take is never sent.
+fn fetch_detail(client: &Client, channel: &str, blueprint: &str, etag: Option<&str>) -> DetailAnswer {
+    if !model::blueprint_usable(blueprint) {
+        return DetailAnswer::Failed(tr!("this blueprint cannot be asked for", "não dá para pedir esta blueprint").into(), None);
+    }
+    match client.request(ApiRequest::Get(&detail_path(channel, blueprint), etag)) {
+        Err(e) => DetailAnswer::Failed(e, None),
+        Ok(a) => detail_answer(a.status, &a.body, etag.is_some(), a.etag, a.retry_after),
+    }
+}
+
+/// What an answer of the detail route means: a 304 keeps the detail held, but only when an
+/// ETag was sent; a 404 without a message is a server without the route; anything else that
+/// is not the detail is a failure with the server's sentence.
+fn detail_answer(status: u16, body: &[u8], etag_sent: bool, etag: Option<String>, retry_after: Option<Duration>) -> DetailAnswer {
+    match status {
+        304 if etag_sent => DetailAnswer::NotModified,
+        304 => DetailAnswer::Failed(unexpected_304().into(), None),
+        401 => DetailAnswer::Failed(sign_in_hint().into(), None),
+        404 if agent::server_error(404, body) == "HTTP 404" => DetailAnswer::Failed(tr!("the site cannot show this blueprint yet", "o site ainda não mostra esta blueprint").into(), None),
+        429 => DetailAnswer::Failed(too_many_requests().into(), Some(Limit(retry_after))),
+        status if status >= 400 => DetailAnswer::Failed(agent::server_error(status, body), None),
+        _ => match model::parse_blueprint_detail(body) {
+            Ok(detail) => DetailAnswer::Data(detail, usable_etag(etag)),
+            Err(e) => DetailAnswer::Failed(e, None),
+        },
+    }
+}
+
+/// The blueprints card's mission screen against a server without the mission route.
+fn no_mission_route() -> &'static str {
+    tr!("The site has no blueprints per mission yet.", "O site ainda não tem as blueprints por missão.")
+}
+
+/// The path of a mission's blueprints: the channel and the contract id percent-encoded, like
+/// every path segment.
+fn mission_path(channel: &str, contract: &str) -> String {
+    format!("/api/channels/{}/overlay/mission/{}/blueprints", model::path_segment(channel), model::path_segment(contract))
+}
+
+/// Read one mission's blueprints (`etag`: of what is held for it, sent as `If-None-Match`).
+/// A contract id the route does not take is never sent.
+fn fetch_mission(client: &Client, channel: &str, contract: &str, etag: Option<&str>) -> MissionAnswer {
+    if !model::contract_usable(contract) {
+        return MissionAnswer::Failed(tr!("this mission cannot be asked for", "não dá para pedir esta missão").into(), None);
+    }
+    match client.request(ApiRequest::Get(&mission_path(channel, contract), etag)) {
+        Err(e) => MissionAnswer::Failed(e, None),
+        Ok(a) => mission_answer(a.status, &a.body, etag.is_some(), a.etag, a.retry_after),
+    }
+}
+
+/// What an answer of the mission route means, read like the detail's (see
+/// [`detail_answer`]): a 404 without a message is a server without the route (the screen says
+/// so); a 404 with one (a contract unknown, or one that gives no blueprint) is the server's
+/// sentence.
+fn mission_answer(status: u16, body: &[u8], etag_sent: bool, etag: Option<String>, retry_after: Option<Duration>) -> MissionAnswer {
+    match status {
+        304 if etag_sent => MissionAnswer::NotModified,
+        304 => MissionAnswer::Failed(unexpected_304().into(), None),
+        401 => MissionAnswer::Failed(sign_in_hint().into(), None),
+        404 if agent::server_error(404, body) == "HTTP 404" => MissionAnswer::Failed(no_mission_route().into(), None),
+        429 => MissionAnswer::Failed(too_many_requests().into(), Some(Limit(retry_after))),
+        status if status >= 400 => MissionAnswer::Failed(agent::server_error(status, body), None),
+        _ => match model::parse_mission_blueprints(body) {
+            Ok(mission) => MissionAnswer::Data(mission, usable_etag(etag)),
+            Err(e) => MissionAnswer::Failed(e, None),
+        },
+    }
+}
+
 /// What the player owns (`GET /api/inventory`, the route the site uses: the signed-in
 /// account's inventory, the same on every channel): the quantities and the places of the
 /// search's item rows, 0 for an item it does not list. Nothing else asks for quantities (the
@@ -757,6 +877,11 @@ enum Results {
     Failed(String),
     Ready(Rc<model::Found>),
 }
+
+/// The blueprints card's list as last built: the search text, the filter and the revision it
+/// was built for (see `Overlay::bp_rows`), and the rows (positions in the index, with whether
+/// the account has each).
+type BpListCache = (String, model::BpFilter, u64, Rc<Vec<(usize, model::BpHave)>>);
 
 /// What the layout was last clamped for: the screen size, each card's size and the size of
 /// the search strip's row (logical px).
@@ -875,6 +1000,19 @@ struct Overlay {
     /// Index requests in a row that failed (for the back-off).
     index_failures: u32,
     index_error: Option<String>,
+    /// The blueprints card: its search text and filter (never saved), the screens opened over
+    /// the list (the one on top is shown; "Voltar" goes back one), the details and the
+    /// missions' blueprints read, the choices of the open blueprint's craft (its key and the
+    /// choices), and the list for the text, the filter and `bp_rev` (which changes with the
+    /// index and with the data), so it is built once per change, not per frame.
+    bp_query: String,
+    bp_filter: model::BpFilter,
+    bp_stack: ScreenStack,
+    details: DetailFetch,
+    missions: MissionFetch,
+    craft: Option<(String, model::CraftState)>,
+    bp_rev: u64,
+    bp_list: RefCell<Option<BpListCache>>,
     /// `(pinned item id, source item id)`: the items that convert into a pinned one that the
     /// closed overlay shows under it.
     source_pins: HashSet<(String, String)>,
@@ -940,6 +1078,16 @@ enum Action {
     MoverQty(i64),
     MoverFilter(String),
     CloseMover,
+    /// The blueprints card's search text and filter.
+    BpQuery(String),
+    BpFilter(model::BpFilter),
+    /// A click on a blueprint's name (its craft), on its "Onde conseguir" or on a mission of
+    /// it: that screen opens over the one shown in the blueprints card.
+    BpGo(BpScreen),
+    /// "Voltar" on a screen of the blueprints card: back to the previous screen.
+    BpBack,
+    /// The choices of the open blueprint's craft (a quality, an option, the manual switch).
+    BpCraft(String, model::CraftState),
 }
 
 /// What happened to a card this frame.
@@ -954,6 +1102,8 @@ struct CardOut {
     resize_stopped: bool,
     /// The pin box was set to this.
     pin: Option<bool>,
+    /// Its ✕ was clicked: the card is switched off, as in the widgets menu.
+    close: bool,
     /// The mouse went down on it (it comes to the front).
     pressed: bool,
     actions: Vec<Action>,
@@ -1015,6 +1165,8 @@ struct Row<'a> {
     qty: String,
     qty_color: Color32,
     qty_hover: Option<&'a str>,
+    /// A small note after the number (a material's quality), and its hover.
+    qty_note: Option<(String, &'a str)>,
     /// `(have, goal)`: a progress bar under the row.
     goal: Option<(f64, f64)>,
     /// Where it is kept, unfolded on a click while open, and the key that remembers it.
@@ -1026,7 +1178,7 @@ struct Row<'a> {
 
 impl<'a> Row<'a> {
     fn new(item_id: &'a str, name: &'a str, qty: String) -> Self {
-        Self { item_id, name, name_hover: None, qty, qty_color: TEXT, qty_hover: None, goal: None, places: None, unpin: false, indent: false }
+        Self { item_id, name, name_hover: None, qty, qty_color: TEXT, qty_hover: None, qty_note: None, goal: None, places: None, unpin: false, indent: false }
     }
 }
 
@@ -1069,7 +1221,7 @@ impl Overlay {
             last_place_check: Instant::now(),
             relayer: RELAYER_FRAMES,
             layout: None,
-            card_sizes: [egui::vec2(widgets::CARD_WIDTH, widgets::CARD_HEADER); widgets::COUNT],
+            card_sizes: [egui::vec2(widgets::CARD_WIDTH, widgets::card_header_height(widgets::text_scale_from(cfg.overlay_text_scale))); widgets::COUNT],
             z: widgets::default_z(),
             clamped_for: None,
             shown: Shown::from_saved(&cfg.overlay_hidden),
@@ -1098,6 +1250,14 @@ impl Overlay {
             index_due: now,
             index_failures: 0,
             index_error: None,
+            bp_query: String::new(),
+            bp_filter: model::BpFilter::All,
+            bp_stack: ScreenStack::new(),
+            details: DetailFetch::default(),
+            missions: MissionFetch::default(),
+            craft: None,
+            bp_rev: 0,
+            bp_list: RefCell::new(None),
             source_pins: widgets::source_pins_from(&cfg.overlay_source_pins),
             expanded: HashSet::new(),
             preview_opacity: false,
@@ -1201,6 +1361,14 @@ impl Overlay {
                     Answer::Inventory(seq, ..) => self.inventory.cancel(seq, now),
                     Answer::Locations(..) => self.locations.cancel(now),
                     Answer::Index(_) => self.index_in_flight = false,
+                    Answer::Detail(key, _) => {
+                        let open = self.bp_is_open(&key);
+                        self.details.cancel(&key, open);
+                    }
+                    Answer::Mission(contract, _) => {
+                        let open = self.mission_is_open(&contract);
+                        self.missions.cancel(&contract, open);
+                    }
                     Answer::Read(_) | Answer::Write(..) => {}
                 }
                 continue;
@@ -1247,6 +1415,24 @@ impl Overlay {
                         Err(e) => self.locations.failed(e, limit.is_some(), now),
                     }
                 }
+                Answer::Detail(key, answer) => {
+                    let limit = match &answer {
+                        DetailAnswer::Failed(_, limit) => *limit,
+                        _ => None,
+                    };
+                    self.engine.on_detail(limit, now);
+                    let open = self.bp_is_open(&key);
+                    self.details.answer(&key, answer, open);
+                }
+                Answer::Mission(contract, answer) => {
+                    let limit = match &answer {
+                        MissionAnswer::Failed(_, limit) => *limit,
+                        _ => None,
+                    };
+                    self.engine.on_mission(limit, now);
+                    let open = self.mission_is_open(&contract);
+                    self.missions.answer(&contract, answer, open);
+                }
             }
         }
         if changed {
@@ -1271,6 +1457,10 @@ impl Overlay {
         self.index_error = None;
         self.inventory.reset();
         self.locations.reset();
+        self.details.reset();
+        self.missions.reset();
+        self.bp_stack.clear();
+        self.craft = None;
         self.mover = None;
         self.toasts.reset_identity();
         self.expanded.clear();
@@ -1293,6 +1483,8 @@ impl Overlay {
                 self.data = Some(d);
                 self.data_etag = etag;
                 self.conn = Conn::Ok;
+                // The blueprints had may have changed: the card's list is built again.
+                self.bp_rev += 1;
             }
             // What is on screen is still the answer (the ETag goes only with data held).
             ReadAnswer::NotModified if self.data.is_some() => {
@@ -1337,10 +1529,9 @@ impl Overlay {
     fn settled(&mut self, ops: &[sync::Op], d: &OverlayData, now: Instant) {
         for op in ops {
             if op.verify && model::still_pinned(d, &op.change) {
-                let body = if matches!(op.change, Local::UnpinMission { .. }) {
-                    tr!("the server did not unpin the mission", "o servidor não desafixou a missão")
-                } else {
-                    tr!("the server did not unpin the item", "o servidor não desafixou o item")
+                let body = match op.change {
+                    Local::UnpinMission { .. } => tr!("the server did not unpin the mission", "o servidor não desafixou a missão"),
+                    _ => tr!("the server did not unpin the item", "o servidor não desafixou o item"),
                 };
                 self.toasts.warn(write_failed(), body, now);
             }
@@ -1393,11 +1584,41 @@ impl Overlay {
         }
     }
 
-    /// Hold `index` (and its ETag); the cached results go with the old one.
+    /// Hold `index` (and its ETag); the cached results and the blueprints card's list go with
+    /// the old one.
     fn set_index(&mut self, index: Option<OverlayIndex>, etag: Option<String>) {
         self.index_etag = if index.is_some() { etag } else { None };
         self.index = index;
         *self.found.borrow_mut() = None;
+        self.bp_rev += 1;
+    }
+
+    /// The blueprints card shows a screen of blueprint `key` (its craft or its missions).
+    fn bp_is_open(&self, key: &str) -> bool {
+        widgets::open_blueprint(&self.bp_stack) == Some(key)
+    }
+
+    /// The blueprints card shows the screen of mission `contract`.
+    fn mission_is_open(&self, contract: &str) -> bool {
+        widgets::open_contract(&self.bp_stack) == Some(contract)
+    }
+
+    /// The blueprints card shows another screen (`forward`: one just opened; else "Voltar"),
+    /// the one before it being about blueprint `before_bp` or mission `before_contract`. A
+    /// blueprint's screen asks for its detail unless the screen before was about that same
+    /// blueprint; a mission's screen asks for its blueprints. Going back, only what is not
+    /// held is asked for. A screen about neither asks nothing more for the one left.
+    fn screen_opened(&mut self, before_bp: Option<&str>, before_contract: Option<&str>, forward: bool) {
+        match widgets::open_blueprint(&self.bp_stack).map(str::to_string) {
+            Some(key) if before_bp == Some(key.as_str()) => {}
+            Some(key) if forward || !self.details.has(&key) => self.details.open(&key),
+            Some(_) | None => self.details.close(),
+        }
+        match widgets::open_contract(&self.bp_stack).map(str::to_string) {
+            Some(contract) if !forward && before_contract == Some(contract.as_str()) => {}
+            Some(contract) if forward || !self.missions.has(&contract) => self.missions.open(&contract),
+            Some(_) | None => self.missions.close(),
+        }
     }
 
     /// The rows as drawn: the server's answer with the changes still on their way.
@@ -1443,24 +1664,32 @@ impl Overlay {
         if self.thread_gone {
             return;
         }
-        // Closed or with the search switched off, nothing is listed. Open, the index (with
-        // the search on) and the inventory (the quantities and places of the search's item
-        // rows, the stacks a move goes by) are kept ready; the channel's locations once
+        // Closed, nothing is listed. Open, the index (with the search or the blueprints card
+        // on) and the inventory (the quantities and places of the search's item rows, the
+        // stacks a move goes by) are kept ready; the detail of the blueprint whose screen is
+        // open, or the blueprints of the mission whose screen is; the channel's locations once
         // something is typed in the move picker's filter.
         let searching = self.open && self.shown.get(Part::Search);
+        // The blueprints card lists the index too, and asks for what its screen on top draws,
+        // only while the card is on screen.
+        let bp_card = self.open && self.shown.get(Part::Card(Widget::Blueprints));
         // An older server is searched per query.
         let fallback = searching && self.index_fallback;
         if fallback {
             self.search.wake(now);
         }
-        let wants_index = searching && now >= self.index_due && !self.index_in_flight;
+        let wants_index = (searching || bp_card) && now >= self.index_due && !self.index_in_flight;
+        let wants_detail = bp_card && widgets::open_blueprint(&self.bp_stack).is_some();
+        let wants_mission = bp_card && widgets::open_contract(&self.bp_stack).is_some();
         let wants_inventory = self.open;
         let wants_locations = self.open && self.mover.as_ref().is_some_and(|m| !m.filter.trim().is_empty());
         let index_in_flight = &mut self.index_in_flight;
+        let details = &mut self.details;
+        let missions = &mut self.missions;
         let inventory = &mut self.inventory;
         let locations = &mut self.locations;
         let search = &mut self.search;
-        if let Some(job) = self.engine.next_job_all(
+        if let Some(job) = self.engine.next_job_with_mission(
             now,
             || {
                 if wants_index {
@@ -1468,6 +1697,8 @@ impl Overlay {
                 }
                 wants_index
             },
+            || if wants_detail { details.due() } else { None },
+            || if wants_mission { missions.due() } else { None },
             || if wants_inventory { inventory.due(now) } else { None },
             || wants_locations && locations.due(now),
             || if fallback { search.due(now) } else { None },
@@ -1478,6 +1709,8 @@ impl Overlay {
                 Job::Read if self.engine.settling() => None,
                 Job::Read => self.data.as_ref().and(self.data_etag.clone()),
                 Job::Index => self.index.as_ref().and(self.index_etag.clone()),
+                Job::Detail(key) => self.details.etag(key),
+                Job::Mission(contract) => self.missions.etag(contract),
                 _ => None,
             };
             if self.cmd_tx.send(Cmd { generation: self.generation, job, etag }).is_err() {
@@ -1502,7 +1735,10 @@ impl Overlay {
             if wants_locations && let Some(wait) = self.locations.wait(now) {
                 ctx.request_repaint_after(soon(wait.max(self.engine.locations_ready_in(now))));
             }
-            if searching && !self.index_in_flight {
+            if (wants_detail && self.details.waiting()) || (wants_mission && self.missions.waiting()) {
+                ctx.request_repaint_after(soon(self.engine.detail_ready_in(now)));
+            }
+            if (searching || bp_card) && !self.index_in_flight {
                 let wait = self.index_due.saturating_duration_since(now).max(self.engine.index_ready_in(now));
                 ctx.request_repaint_after(soon(wait));
             }
@@ -1702,7 +1938,12 @@ impl Overlay {
         let ppp = ctx.pixels_per_point();
         let origin = os::monitor_rect(self.monitor).map_or([0.0, 0.0], |r| [r[0] as f32 / ppp, r[1] as f32 / ppp]);
         let legacy = legacy.map(|p| [p[0] - origin[0], p[1] - origin[1]]);
-        self.layout = Some(widgets::resolve(&saved, legacy, [screen.x, screen.y]));
+        let size = [screen.x, screen.y];
+        let mut layout = widgets::resolve(&saved, legacy, size);
+        // Every header whole on screen at the text size in use (a larger text, a taller
+        // header); the measured sizes take over from the first frame drawn.
+        widgets::clamp_layout(&mut layout, &[[widgets::CARD_WIDTH, widgets::card_header_height(self.text_scale)]; widgets::COUNT], size);
+        self.layout = Some(layout);
     }
 
     /// The frame after opening: bring the window to the front, remembering who had the focus.
@@ -1868,6 +2109,25 @@ impl Overlay {
                     }
                 }
                 Action::CloseMover => self.mover = None,
+                // Neither the card's text nor its filter is ever saved.
+                Action::BpQuery(text) => self.bp_query = widgets::cut_search_text(text),
+                Action::BpFilter(filter) => self.bp_filter = filter,
+                // A screen opens over the one shown. Opening a blueprint's screen from
+                // anything but a screen of that same blueprint asks for its detail, and opening
+                // a mission's screen for its blueprints (again, with the ETag, when read before).
+                Action::BpGo(screen) => {
+                    let (blueprint, contract) = (widgets::open_blueprint(&self.bp_stack).map(str::to_string), widgets::open_contract(&self.bp_stack).map(str::to_string));
+                    widgets::screen_push(&mut self.bp_stack, screen);
+                    self.screen_opened(blueprint.as_deref(), contract.as_deref(), true);
+                }
+                // Back one screen: what it draws is asked for again only when nothing is held
+                // for it (it was drawn a moment ago).
+                Action::BpBack => {
+                    let (blueprint, contract) = (widgets::open_blueprint(&self.bp_stack).map(str::to_string), widgets::open_contract(&self.bp_stack).map(str::to_string));
+                    widgets::screen_back(&mut self.bp_stack);
+                    self.screen_opened(blueprint.as_deref(), contract.as_deref(), false);
+                }
+                Action::BpCraft(key, state) => self.craft = Some((key, state)),
                 Action::ToggleSource(item, source) => {
                     if widgets::toggle_source_pin(&mut self.source_pins, &item, &source) {
                         self.mark_finished();
@@ -1909,14 +2169,20 @@ impl Overlay {
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) && self.mover.take().is_none() {
             // A text kept in a search switched off is not on screen: nothing to empty.
             let text = if self.shown.get(Part::Search) { self.search.text.as_str() } else { "" };
-            match widgets::esc_step(self.menu_open, text) {
-                EscStep::Menu => self.menu_open = false,
-                EscStep::Search => {
-                    self.search.clear();
-                    self.search_filter = Filter::Tudo;
-                    ctx.memory_mut(|m| m.surrender_focus(search_id()));
+            if ctx.memory(|m| m.has_focus(bp_search_id())) {
+                // In the blueprints card's field: Esc empties it and leaves it.
+                self.bp_query.clear();
+                ctx.memory_mut(|m| m.surrender_focus(bp_search_id()));
+            } else {
+                match widgets::esc_step(self.menu_open, text) {
+                    EscStep::Menu => self.menu_open = false,
+                    EscStep::Search => {
+                        self.search.clear();
+                        self.search_filter = Filter::Tudo;
+                        ctx.memory_mut(|m| m.surrender_focus(search_id()));
+                    }
+                    EscStep::Close => self.set_open(ctx, false),
                 }
-                EscStep::Close => self.set_open(ctx, false),
             }
         }
         // Before the strip is drawn: the field gets the focus this very frame.
@@ -1927,7 +2193,8 @@ impl Overlay {
 
     // ----- drawing ----------------------------------------------------------------------
 
-    /// Whether a card has anything to draw (closed, an empty card is not drawn at all).
+    /// Whether a card has anything to draw (closed, an empty card is not drawn at all). The
+    /// blueprints card is a tool to browse, not a status to glance at: never drawn closed.
     fn has_content(&self, w: Widget, here: &[model::HereRow]) -> bool {
         let Some(d) = &self.view else { return false };
         match w {
@@ -1936,6 +2203,7 @@ impl Overlay {
             Widget::Aqui => !here.is_empty(),
             Widget::Registros => !d.notices.is_empty() || d.pending > 0.0,
             Widget::Missoes => !d.missions.is_empty(),
+            Widget::Blueprints => false,
         }
     }
 
@@ -1982,7 +2250,9 @@ impl Overlay {
                     l[i].pinned = p;
                 }
             }
-            changed |= out.drag_stopped || out.resize_stopped || out.pin.is_some();
+            // Its ✕: switched off exactly as the widgets menu does it (its pin kept).
+            let closed = out.close && self.shown.set(Part::Card(w), false);
+            changed |= out.drag_stopped || out.resize_stopped || out.pin.is_some() || closed;
             actions.extend(out.actions);
         }
         // The card pressed comes to the front (where cards overlap, the one already in front
@@ -1995,7 +2265,7 @@ impl Overlay {
                 ctx.memory_mut(|m| m.areas_mut().move_to_top(card_layer(Widget::ALL[i])));
             }
         }
-        // A drop, a release of the corner or a pin box: finished changes, saved right away.
+        // A drop, a release of the corner, a pin box or a ✕: finished changes, saved right away.
         if changed {
             self.commit(ctx);
         }
@@ -2021,16 +2291,27 @@ impl Overlay {
                     ui.set_width(sized.map_or(widgets::CARD_WIDTH, |s| s[0]) - 2.0 * CARD_MARGIN);
                     let top = ui.cursor().top();
                     self.card_header(ui, w, place.pinned, &mut out);
+                    // Above the rows, not scrolling with them: the blueprints card's search.
+                    if w == Widget::Blueprints {
+                        self.blueprints_top(ui, &mut out.actions);
+                    }
+                    // A scroll position per screen (its depth in the stack and the screen
+                    // itself): every screen is where it was left when "Voltar" comes back to it.
+                    let screen_key = match w {
+                        Widget::Blueprints => (self.bp_stack.len(), self.bp_stack.last()),
+                        _ => (0, None),
+                    };
                     match sized {
-                        // Resized: exactly that tall, the rows scroll inside.
+                        // Resized: exactly that tall, the rows scroll inside (the header's
+                        // height, at any text size, is measured above).
                         Some(s) => {
                             let body = (s[1] - 2.0 * CARD_MARGIN - (ui.cursor().top() - top)).max(MIN_BODY);
-                            egui::ScrollArea::vertical().max_height(body).min_scrolled_height(body).auto_shrink([false, false]).show(ui, |ui| self.card_body(ui, w, here, &mut out.actions));
+                            egui::ScrollArea::vertical().id_salt(("card-body", screen_key)).max_height(body).min_scrolled_height(body).auto_shrink([false, false]).show(ui, |ui| self.card_body(ui, w, here, &mut out.actions));
                         }
                         // Without the minimum a card in an auto-sized area stops at egui's 64 px default.
                         None => {
                             let max = CARD_BODY_MAX * self.text_scale;
-                            egui::ScrollArea::vertical().max_height(max).min_scrolled_height(max).auto_shrink([false, true]).show(ui, |ui| self.card_body(ui, w, here, &mut out.actions));
+                            egui::ScrollArea::vertical().id_salt(("card-body", screen_key)).max_height(max).min_scrolled_height(max).auto_shrink([false, true]).show(ui, |ui| self.card_body(ui, w, here, &mut out.actions));
                         }
                     }
                 });
@@ -2044,7 +2325,9 @@ impl Overlay {
         out
     }
 
-    /// The card's title; while open also the drag handle and the "fixar na tela" box.
+    /// The card's title; while open also the drag handle, the "fixar na tela" box (not on the
+    /// blueprints card, which is never drawn closed) and, at the top right corner, the ✕ that
+    /// hides the card. Everything in it grows with the text size, like the body.
     fn card_header(&self, ui: &mut egui::Ui, w: Widget, pinned: bool, out: &mut CardOut) {
         let s = self.text_scale;
         let note = if w == Widget::Aqui { self.view.as_ref().and_then(model::current_place) } else { None };
@@ -2053,7 +2336,7 @@ impl Overlay {
             return;
         }
         let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 22.0 * s), egui::Sense::hover());
-        // The drag area goes first, so the pin box added on top of it wins its clicks.
+        // The drag area goes first, so the pin box and the ✕ added on top of it win their clicks.
         let drag = ui.interact(rect, ui.id().with("card-drag"), egui::Sense::drag());
         if drag.dragged() {
             out.drag += drag.drag_delta();
@@ -2065,15 +2348,26 @@ impl Overlay {
             out.drag_stopped = true;
         }
         ui.scope_builder(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::left_to_right(egui::Align::Center)), |ui| {
+            // The pin box's square follows the text too, in the header only.
+            let spacing = ui.spacing_mut();
+            spacing.icon_width *= s;
+            spacing.icon_width_inner *= s;
+            spacing.icon_spacing *= s;
             card_title(ui, w.title(), note.as_deref(), s);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if close_button(ui, 14.0 * s).on_hover_text(tr!("Close this card", "Fechar este cartão")).clicked() {
+                    out.close = true;
+                }
+                if w == Widget::Blueprints {
+                    return;
+                }
                 let mut on = pinned;
                 if ui.checkbox(&mut on, RichText::new(tr!("pin to screen", "fixar na tela")).color(MUTED).size(SMALL * s)).on_hover_text(tr!("Stays on screen with the overlay closed", "Continua na tela com o overlay fechado")).changed() {
                     out.pin = Some(on);
                 }
             });
         });
-        ui.add_space(2.0);
+        ui.add_space(2.0 * s);
     }
 
     /// The rows of a card, or one line saying there is nothing (only drawn while open).
@@ -2094,7 +2388,156 @@ impl Overlay {
             Widget::Registros => self.registros(ui, d),
             Widget::Missoes if d.missions.is_empty() => empty(ui, tr!("No pinned missions.", "Nenhuma missão fixada."), s),
             Widget::Missoes => self.missoes(ui, d, actions),
+            Widget::Blueprints => self.blueprints(ui, d, actions),
         }
+    }
+
+    /// The blueprint whose screen the blueprints card shows, with which screen; `None` on the
+    /// list, on a mission's screen, and when the open blueprint is not in the index (any more).
+    fn bp_screen(&self) -> Option<(&model::IndexBlueprint, BpPanel)> {
+        let Some(BpScreen::Blueprint(key, panel)) = self.bp_stack.last() else { return None };
+        let b = self.index.as_ref()?.blueprints.iter().find(|b| b.blueprint == *key)?;
+        Some((b, *panel))
+    }
+
+    /// The mission whose screen the blueprints card shows: its contract, and the title and
+    /// giver of the line it was opened from.
+    fn mission_screen(&self) -> Option<(&str, &str, Option<&str>)> {
+        match self.bp_stack.last()? {
+            BpScreen::Mission { contract, title, giver } => Some((contract.as_str(), title.as_str(), giver.as_deref())),
+            BpScreen::Blueprint(..) => None,
+        }
+    }
+
+    /// `blueprint` is in the index, so its screen can be shown.
+    fn in_index(&self, blueprint: &str) -> bool {
+        self.index.as_ref().is_some_and(|index| index.blueprints.iter().any(|b| b.blueprint == blueprint))
+    }
+
+    /// "‹ Voltar", its hover text saying where it leads (the previous screen, however deep),
+    /// then `title`.
+    fn back_row(&self, ui: &mut egui::Ui, title: &str, actions: &mut Vec<Action>) {
+        let s = self.text_scale;
+        ui.horizontal(|ui| {
+            let back = egui::Button::new(RichText::new(tr!("‹ Back", "‹ Voltar")).size(SMALL * s));
+            if ui.add(back).on_hover_text(widgets::back_hint(&self.bp_stack)).clicked() {
+                actions.push(Action::BpBack);
+            }
+            ui.add(egui::Label::new(RichText::new(title).color(TEXT_BRIGHT).strong()).truncate());
+        });
+    }
+
+    /// The top of a blueprint's screen, in place of the list's: "Voltar", the blueprint's
+    /// name, then whether the account has it and what it makes. The craft screen adds "Onde
+    /// conseguir" (or "não disponível") and, under that line, what the server says of the
+    /// crafted item (type, size, grade, class, manufacturer); the "Onde conseguir" screen says
+    /// so as its title, with the one rule of the pools under it.
+    fn bp_screen_top(&self, ui: &mut egui::Ui, b: &model::IndexBlueprint, panel: BpPanel, actions: &mut Vec<Action>) {
+        let s = self.text_scale;
+        self.back_row(ui, &b.name, actions);
+        let acquired = self.view.as_ref().and_then(|d| d.acquired_blueprints.as_deref());
+        let keys: Option<HashSet<&str>> = acquired.map(|l| l.iter().map(String::as_str).collect());
+        let have = model::blueprint_have(b, keys.as_ref());
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(have.text()).color(if have.had() { OK } else { MUTED }).size(SMALL * s).strong());
+            if !b.kind.is_empty() {
+                ui.label(RichText::new(&b.kind).color(MUTED).size(SMALL * s));
+            }
+            if panel == BpPanel::Craft {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| self.bp_where_cell(ui, b, actions));
+            }
+        });
+        if panel == BpPanel::Craft
+            && let Some(line) = self.details.get(&b.blueprint).and_then(|d| model::facts_line(&d.facts))
+        {
+            ui.add(egui::Label::new(RichText::new(line).color(MUTED).size(SMALL * s)).wrap());
+        }
+        if panel == BpPanel::Where {
+            ui.horizontal(|ui| card_title(ui, model::where_label(), None, s));
+            empty(ui, model::never_twice_note(), s);
+        }
+        ui.add_space(2.0 * s);
+    }
+
+    /// The top of a mission's screen: "Voltar" and the mission's title (the answer's, else the
+    /// line's it was opened from), who gives it, the screen's title and the one rule of the
+    /// pools.
+    fn mission_screen_top(&self, ui: &mut egui::Ui, contract: &str, title: &str, giver: Option<&str>, actions: &mut Vec<Action>) {
+        let s = self.text_scale;
+        let held = self.missions.get(contract);
+        let title = held.map(|m| m.title.as_str()).filter(|t| !t.trim().is_empty()).unwrap_or(title);
+        let title = if title.trim().is_empty() { tr!("Mission", "Missão") } else { title };
+        self.back_row(ui, title, actions);
+        let giver = match held {
+            Some(m) => m.giver.as_deref(),
+            None => giver,
+        };
+        if let Some(g) = giver.filter(|g| !g.trim().is_empty()) {
+            ui.add(egui::Label::new(RichText::new(g).color(MUTED).size(SMALL * s)).truncate());
+        }
+        ui.horizontal(|ui| card_title(ui, model::mission_screen_title(), None, s));
+        empty(ui, model::never_twice_note(), s);
+        ui.add_space(2.0 * s);
+    }
+
+    /// "Onde conseguir" for a blueprint that can be obtained and is not a default one (a
+    /// click shows its missions' screen), "não disponível" for one nothing gives, nothing for
+    /// a default one or a key the detail route does not take.
+    fn bp_where_cell(&self, ui: &mut egui::Ui, b: &model::IndexBlueprint, actions: &mut Vec<Action>) {
+        let s = self.text_scale;
+        match model::where_cell(b) {
+            model::WhereCell::Button if model::blueprint_usable(&b.blueprint) => {
+                let button = egui::Button::new(RichText::new(model::where_label()).size(SMALL * s));
+                if ui.add(button).on_hover_text(tr!("the missions that give it", "as missões que dão esta blueprint")).clicked() {
+                    actions.push(Action::BpGo(BpScreen::Blueprint(b.blueprint.clone(), BpPanel::Where)));
+                }
+            }
+            model::WhereCell::NotAvailable => {
+                ui.label(RichText::new(model::not_available_label()).color(MUTED).size(SMALL * s)).on_hover_text(tr!("nothing in the game gives it", "nada no jogo dá esta blueprint"));
+            }
+            model::WhereCell::Button | model::WhereCell::Nothing => {}
+        }
+    }
+
+    /// The top of the blueprints card, above what scrolls. On the list: "adquiridas N de M"
+    /// (when the server sends the counts), the card's own search field (lit like the overlay's
+    /// main one), and the filter Todas / Adquiridas / Não adquiridas. On a blueprint's screen:
+    /// `bp_screen_top`; on a mission's: `mission_screen_top`.
+    fn blueprints_top(&self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        let s = self.text_scale;
+        if let Some((contract, title, giver)) = self.mission_screen() {
+            self.mission_screen_top(ui, contract, title, giver, actions);
+            return;
+        }
+        if let Some((b, panel)) = self.bp_screen() {
+            self.bp_screen_top(ui, b, panel, actions);
+            return;
+        }
+        if let Some(line) = self.view.as_ref().and_then(model::acquired_line) {
+            ui.label(RichText::new(line).color(MUTED).size(SMALL * s)).on_hover_text(tr!("blueprints of this channel the account has, of those that can be obtained", "blueprints deste canal que a conta tem, das que dá para obter"));
+        }
+        let mut text = self.bp_query.clone();
+        let changed = ui
+            .scope(|ui| {
+                light_field_strokes(ui);
+                let field = light_field(&mut text, RichText::new(tr!("Search blueprints…", "Buscar blueprints…"))).id(bp_search_id()).desired_width(f32::INFINITY);
+                ui.add(field).changed()
+            })
+            .inner;
+        if changed {
+            actions.push(Action::BpQuery(text));
+        }
+        ui.horizontal(|ui| {
+            for f in model::BpFilter::ALL {
+                let on = f == self.bp_filter;
+                let label = RichText::new(f.label()).size(SMALL * s).color(if on { BRASS } else { MUTED });
+                let b = if on { egui::Button::new(label).stroke(egui::Stroke::new(1.0_f32, BRASS)) } else { egui::Button::new(label) };
+                if ui.add(b).clicked() && !on {
+                    actions.push(Action::BpFilter(f));
+                }
+            }
+        });
+        ui.add_space(2.0 * s);
     }
 
     /// Why the `-` / `+` of an item are disabled, if they are: its unpin is on its way
@@ -2297,6 +2740,10 @@ impl Overlay {
                     }
                     adjust_buttons(ui, row.item_id, self.adjust_off(row.item_id, leaving), s, actions);
                 }
+                // Right to left: the note goes first so it is drawn after the number.
+                if let Some((note, hover)) = &row.qty_note {
+                    ui.label(RichText::new(note.as_str()).color(MUTED).size(SMALL * s)).on_hover_text(*hover);
+                }
                 let q = ui.label(RichText::new(&row.qty).color(if unconfirmed { WARN } else { row.qty_color }).strong());
                 if unconfirmed {
                     q.on_hover_text(unconfirmed_hint());
@@ -2470,6 +2917,340 @@ impl Overlay {
         }
     }
 
+    /// The blueprints card's rows (see `model::blueprint_list`), built again only when the
+    /// search text, the filter, the index or the data changed.
+    fn bp_rows(&self, index: &OverlayIndex, d: &OverlayData) -> Rc<Vec<(usize, model::BpHave)>> {
+        let mut cache = self.bp_list.borrow_mut();
+        if let Some((query, filter, rev, rows)) = cache.as_ref()
+            && *query == self.bp_query
+            && *filter == self.bp_filter
+            && *rev == self.bp_rev
+        {
+            return rows.clone();
+        }
+        let rows = Rc::new(model::blueprint_list(&index.blueprints, &self.bp_query, self.bp_filter, d.acquired_blueprints.as_deref()));
+        *cache = Some((self.bp_query.clone(), self.bp_filter, self.bp_rev, rows.clone()));
+        rows
+    }
+
+    /// What scrolls in the blueprints card (its top is `blueprints_top`). On a mission's
+    /// screen: its pools. On a blueprint's screen: its craft, or the missions that give it. On
+    /// the list: every blueprint of the
+    /// index that passes the card's search and filter, by name, one fixed-height row each;
+    /// only the rows inside the card's scroll view are laid out (`widgets::visible_rows`; the
+    /// room of the others is left empty), so thousands of blueprints cost a screenful of rows
+    /// per frame.
+    fn blueprints(&self, ui: &mut egui::Ui, d: &OverlayData, actions: &mut Vec<Action>) {
+        let s = self.text_scale;
+        let Some(index) = &self.index else {
+            if self.index_fallback {
+                empty(ui, no_blueprint_list(), s);
+            } else if let Some(error) = &self.index_error {
+                ui.add(egui::Label::new(RichText::new(error.as_str()).color(WARN).size(SMALL * s)).wrap());
+            } else {
+                empty(ui, tr!("loading…", "carregando…"), s);
+            }
+            return;
+        };
+        if index.blueprints.is_empty() {
+            empty(ui, no_blueprint_list(), s);
+            return;
+        }
+        if let Some((contract, ..)) = self.mission_screen() {
+            ui.push_id(("bp-mission", contract), |ui| self.bp_mission(ui, contract, actions));
+            return;
+        }
+        if let Some((b, panel)) = self.bp_screen() {
+            ui.push_id(("bp-screen", b.blueprint.as_str()), |ui| match panel {
+                BpPanel::Craft => self.bp_craft(ui, &b.blueprint, actions),
+                BpPanel::Where => self.bp_where(ui, &b.blueprint, actions),
+            });
+            return;
+        }
+        let rows = self.bp_rows(index, d);
+        if rows.is_empty() {
+            empty(ui, tr!("No blueprint found.", "Nenhuma blueprint encontrada."), s);
+            return;
+        }
+        let row_h = ui.spacing().interact_size.y.max((BODY + 6.0) * s);
+        let pitch = row_h + ui.spacing().item_spacing.y;
+        self.bp_rows_in_view(ui, index, &rows, row_h, pitch, actions);
+    }
+
+    /// `rows`, each `row_h` tall (`pitch` with the room between two), from where the cursor
+    /// is: those inside the scroll view drawn, the room of the others left empty.
+    fn bp_rows_in_view(&self, ui: &mut egui::Ui, index: &OverlayIndex, rows: &[(usize, model::BpHave)], row_h: f32, pitch: f32, actions: &mut Vec<Action>) {
+        let clip = ui.clip_rect();
+        let shown = widgets::visible_rows(ui.cursor().top(), clip.top(), clip.bottom(), rows.len(), pitch);
+        if shown.start > 0 {
+            ui.add_space(shown.start as f32 * pitch);
+        }
+        for &(i, have) in &rows[shown.clone()] {
+            ui.push_id(("bp-row", i), |ui| self.bp_row(ui, &index.blueprints[i], have, row_h, actions));
+        }
+        let after = rows.len() - shown.end;
+        if after > 0 {
+            ui.add_space(after as f32 * pitch);
+        }
+    }
+
+    /// One row of the blueprints list, exactly `row_h` tall: first, whether the account has it
+    /// (a mark and a word: never colour alone); then its name (a click shows its screen) and,
+    /// small, what it makes; at the end what `bp_where_cell` draws. A key the detail route
+    /// does not take leaves the row read-only.
+    fn bp_row(&self, ui: &mut egui::Ui, b: &model::IndexBlueprint, have: model::BpHave, row_h: f32, actions: &mut Vec<Action>) {
+        let s = self.text_scale;
+        let key = b.blueprint.as_str();
+        let usable = model::blueprint_usable(key);
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), row_h), egui::Sense::hover());
+        ui.scope_builder(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::left_to_right(egui::Align::Center)), |ui| {
+            // A cell of its own width, so the names line up whatever the word.
+            let (cell, _) = ui.allocate_exact_size(egui::vec2(BP_STATE_WIDTH * s, row_h), egui::Sense::hover());
+            ui.scope_builder(egui::UiBuilder::new().max_rect(cell).layout(egui::Layout::left_to_right(egui::Align::Center)), |ui| {
+                ui.label(RichText::new(have.text()).color(if have.had() { OK } else { MUTED }).size(SMALL * s).strong());
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.bp_where_cell(ui, b, actions);
+                if !b.kind.is_empty() {
+                    ui.label(RichText::new(&b.kind).color(MUTED).size(SMALL * s));
+                }
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    let text = RichText::new(&b.name).color(TEXT);
+                    if !usable {
+                        ui.add(egui::Label::new(text).truncate());
+                        return;
+                    }
+                    let name = ui.add(egui::Label::new(text).sense(egui::Sense::click()).truncate()).on_hover_text(tr!("open the blueprint: its craft", "abrir a blueprint: a fabricação"));
+                    if name.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    if name.clicked() {
+                        actions.push(Action::BpGo(BpScreen::Blueprint(key.to_string(), BpPanel::Craft)));
+                    }
+                });
+            });
+        });
+    }
+
+    /// On a blueprint's screen, while its detail is not there: "carregando…", or the server's
+    /// sentence when the request failed (the detail held, if any, is still drawn after it).
+    /// `None` until there is a detail to draw.
+    fn bp_detail(&self, ui: &mut egui::Ui, key: &str) -> Option<&model::BlueprintDetail> {
+        let s = self.text_scale;
+        if let Some(error) = self.details.error(key) {
+            ui.add(egui::Label::new(RichText::new(error).color(WARN).size(SMALL * s)).wrap());
+        }
+        let detail = self.details.get(key);
+        if detail.is_none() && self.details.error(key).is_none() {
+            empty(ui, tr!("loading…", "carregando…"), s);
+        }
+        detail
+    }
+
+    /// The craft of the open blueprint `key`: its time, "Informar manualmente", per slot its
+    /// name, the material in use (`have / need`, short ones drawn like the rows of "Falta"), a
+    /// selector when the slot takes several, and a quality control (a slider over the
+    /// material's tiers showing the chosen tier's quality, its single tier as text, or a
+    /// number field when it has none or by hand); then what the crafted item gets, computed
+    /// here (`model::craft_result`) at those qualities, and "pronta" when every material in
+    /// use is there. A change goes out as the whole new set of choices (`Action::BpCraft`).
+    fn bp_craft(&self, ui: &mut egui::Ui, key: &str, actions: &mut Vec<Action>) {
+        let s = self.text_scale;
+        {
+            let Some(d) = self.bp_detail(ui, key) else { return };
+            let state = match &self.craft {
+                Some((k, st)) if k == key && st.fits(d) => st.clone(),
+                _ => model::CraftState::start(d),
+            };
+            let mut next = state.clone();
+            if let Some(t) = model::craft_time(d.craft_time_sec) {
+                ui.label(RichText::new(trf!("craft time {t}", "tempo de fabricação {t}")).color(MUTED).size(SMALL * s));
+            }
+            // The switch only when some slot has tiers to switch from.
+            if d.slots.iter().any(|slot| slot.options.iter().any(|o| !o.tiers.bands.is_empty())) {
+                ui.horizontal(|ui| {
+                    if toggle_switch(ui, state.manual).on_hover_text(tr!("type each quality instead of choosing a tier", "digitar cada qualidade em vez de escolher a faixa")).clicked() {
+                        next = model::with_manual(d, &next, !state.manual);
+                    }
+                    ui.label(RichText::new(tr!("Enter manually", "Informar manualmente")).color(TEXT).size(SMALL * s));
+                });
+            }
+            for (n, (slot, choice)) in d.slots.iter().zip(&state.slots).enumerate() {
+                ui.push_id(("slot", n), |ui| {
+                    ui.add_space(2.0 * s);
+                    ui.label(RichText::new(&slot.name).color(MUTED).size(SMALL * s).strong());
+                    let Some(o) = slot.options.get(choice.option) else {
+                        empty(ui, tr!("no known material", "sem material conhecido"), s);
+                        return;
+                    };
+                    if slot.options.len() > 1 {
+                        ui.horizontal_wrapped(|ui| {
+                            for (j, option) in slot.options.iter().enumerate() {
+                                let on = j == choice.option;
+                                let b = egui::Button::new(RichText::new(&option.name).size(SMALL * s).color(if on { BRASS } else { MUTED })).selected(on);
+                                if ui.push_id(("option", j), |ui| ui.add(b)).inner.on_hover_text(tr!("the material used in this slot", "o material usado nesta parte")).clicked() && !on {
+                                    next = model::with_option(d, &next, n, j);
+                                }
+                            }
+                        });
+                    }
+                    // No item id: the row is read-only (no - / +, no places).
+                    let label = model::material_label(o);
+                    let mut row = Row::new("", &label, model::material_amount(o));
+                    row.qty_color = if model::material_short(o) { TEXT } else { ACCENT };
+                    row.goal = (o.need > 0.0).then_some((o.have, o.need));
+                    self.item_row(ui, row, actions);
+                    // A quality control only where the quality changes something.
+                    if !slot.effects.is_empty() {
+                        ui.horizontal(|ui| {
+                            ui.add_space(INDENT);
+                            ui.label(RichText::new(tr!("quality", "qualidade")).color(MUTED).size(SMALL * s));
+                            let tiers = o.tiers.bands.len();
+                            if model::on_tiers(o, state.manual) && tiers == 1 {
+                                ui.label(RichText::new(o.tiers.bands[0].value.to_string()).color(TEXT_BRIGHT).strong());
+                            } else if model::on_tiers(o, state.manual) {
+                                let mut stop = choice.stop.min(tiers - 1);
+                                ui.spacing_mut().slider_width = (ui.available_width() - 48.0 * s).max(60.0);
+                                if ui.add(egui::Slider::new(&mut stop, 0..=tiers - 1).show_value(false)).on_hover_text(tr!("the material's quality tiers", "as faixas de qualidade do material")).changed() {
+                                    next = model::with_stop(&next, n, stop);
+                                }
+                                ui.label(RichText::new(o.tiers.bands[stop].value.to_string()).color(TEXT_BRIGHT).strong());
+                            } else {
+                                let mut q = model::slot_quality(o, choice, state.manual);
+                                let min = model::clamp_quality(o.min_quality, 0);
+                                if ui.add(egui::DragValue::new(&mut q).range(min..=wikelo_core::MAX_QUALITY)).changed() {
+                                    next = model::with_quality(d, &next, n, q);
+                                }
+                            }
+                        });
+                    }
+                });
+            }
+            ui.add_space(4.0 * s);
+            let lines = model::craft_result(d, &next);
+            if lines.is_empty() {
+                empty(ui, tr!("The quality changes nothing in this craft.", "A qualidade não muda nada nesta fabricação."), s);
+            } else {
+                ui.horizontal(|ui| card_title(ui, tr!("Result", "Resultado"), None, s));
+                for line in lines {
+                    ui.add(egui::Label::new(RichText::new(line).color(TEXT).size(SMALL * s)).truncate());
+                }
+            }
+            if model::craft_ready(d, &next) {
+                ui.label(RichText::new(tr!("ready", "pronta")).color(OK).size(SMALL * s).strong()).on_hover_text(tr!("every material in use is there for one craft", "tem todo o material escolhido para fabricar uma"));
+            }
+            if next != state {
+                actions.push(Action::BpCraft(key.to_string(), next));
+            }
+        }
+    }
+
+    /// "Onde conseguir" of the open blueprint `key`: one line per mission that gives it (its
+    /// title, who gives it, when, and "nem sempre entrega (N%)" when its reward does not
+    /// always give a blueprint), in the server's order, then "+N" for those the server did not
+    /// list. A line with a contract (a newer server) opens the mission's blueprints.
+    fn bp_where(&self, ui: &mut egui::Ui, key: &str, actions: &mut Vec<Action>) {
+        let s = self.text_scale;
+        {
+            let Some(d) = self.bp_detail(ui, key) else { return };
+            if d.sources.is_empty() && d.sources_more == 0 {
+                empty(ui, tr!("No known mission gives it.", "Nenhuma missão conhecida dá esta blueprint."), s);
+            }
+            for (n, source) in d.sources.iter().enumerate() {
+                ui.push_id(("source", n), |ui| {
+                    let text = RichText::new(model::mission_line(source)).color(TEXT).size(SMALL * s);
+                    let Some(contract) = &source.contract_id else {
+                        ui.add(egui::Label::new(text).wrap());
+                        return;
+                    };
+                    let line = ui.add(egui::Label::new(text).sense(egui::Sense::click()).wrap()).on_hover_text(tr!("the blueprints this mission gives", "as blueprints que esta missão dá"));
+                    if line.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    if line.clicked() {
+                        actions.push(Action::BpGo(BpScreen::Mission { contract: contract.clone(), title: source.title.clone(), giver: source.giver.clone() }));
+                    }
+                });
+            }
+            if let Some(more) = model::more_missions(d.sources_more) {
+                empty(ui, &more, s);
+            }
+        }
+    }
+
+    /// A mission's blueprints (its screen's top is `mission_screen_top`): while they are not
+    /// there, "carregando…" or the server's sentence (what was held, if any, is still drawn
+    /// after it). Then per pool: when it pays and "N de M adquiridas", "nem sempre entrega
+    /// (N%)" when its reward does not always give one, that the mission gives no more once
+    /// every one is had, and its blueprints by name, each saying first whether the account has
+    /// it, then its name (a click opens its craft) and, small, its kind.
+    fn bp_mission(&self, ui: &mut egui::Ui, contract: &str, actions: &mut Vec<Action>) {
+        let s = self.text_scale;
+        if let Some(error) = self.missions.error(contract) {
+            ui.add(egui::Label::new(RichText::new(error).color(WARN).size(SMALL * s)).wrap());
+        }
+        let Some(m) = self.missions.get(contract) else {
+            if self.missions.error(contract).is_none() {
+                empty(ui, tr!("loading…", "carregando…"), s);
+            }
+            return;
+        };
+        if m.pools.is_empty() {
+            empty(ui, tr!("This mission gives no blueprint.", "Esta missão não dá nenhuma blueprint."), s);
+        }
+        let row_h = ui.spacing().interact_size.y.max((BODY + 6.0) * s);
+        for (n, pool) in m.pools.iter().enumerate() {
+            ui.push_id(("pool", n), |ui| {
+                if n > 0 {
+                    ui.add_space(6.0 * s);
+                }
+                ui.add(egui::Label::new(RichText::new(model::pool_heading(pool)).color(TEXT_BRIGHT).size(SMALL * s).strong()).wrap());
+                for note in model::pool_notes(pool) {
+                    ui.add(egui::Label::new(RichText::new(note).color(MUTED).size(SMALL * s)).wrap());
+                }
+                for (i, b) in pool.blueprints.iter().enumerate() {
+                    ui.push_id(("pool-bp", i), |ui| self.pool_row(ui, b, row_h, actions));
+                }
+            });
+        }
+    }
+
+    /// One blueprint of a mission's pool, `row_h` tall, laid out like a row of the list: the
+    /// mark and the word first, then its name (a click opens its craft, when the card can show
+    /// it) and, small, its kind.
+    fn pool_row(&self, ui: &mut egui::Ui, b: &model::PoolBlueprint, row_h: f32, actions: &mut Vec<Action>) {
+        let s = self.text_scale;
+        let have = b.have();
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), row_h), egui::Sense::hover());
+        ui.scope_builder(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::left_to_right(egui::Align::Center)), |ui| {
+            let (cell, _) = ui.allocate_exact_size(egui::vec2(BP_STATE_WIDTH * s, row_h), egui::Sense::hover());
+            ui.scope_builder(egui::UiBuilder::new().max_rect(cell).layout(egui::Layout::left_to_right(egui::Align::Center)), |ui| {
+                ui.label(RichText::new(have.text()).color(if have.had() { OK } else { MUTED }).size(SMALL * s).strong());
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if !b.kind.is_empty() {
+                    ui.label(RichText::new(&b.kind).color(MUTED).size(SMALL * s));
+                }
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    let text = RichText::new(&b.name).color(TEXT);
+                    if !model::blueprint_usable(&b.blueprint) {
+                        ui.add(egui::Label::new(text).truncate());
+                        return;
+                    }
+                    let name = ui.add(egui::Label::new(text).sense(egui::Sense::click()).truncate()).on_hover_text(tr!("open the blueprint: its craft", "abrir a blueprint: a fabricação"));
+                    if name.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    // Only a blueprint of the index has a screen (it is looked up on the click
+                    // alone, not on every frame).
+                    if name.clicked() && self.in_index(&b.blueprint) {
+                        actions.push(Action::BpGo(BpScreen::Blueprint(b.blueprint.clone(), BpPanel::Craft)));
+                    }
+                });
+            });
+        });
+    }
+
     /// Pending changes on the site and the latest notices (the records; the alerts pop up as
     /// toasts, see `Toasts::feed`).
     fn registros(&self, ui: &mut egui::Ui, d: &OverlayData) {
@@ -2591,11 +3372,11 @@ impl Overlay {
         let up = widgets::unfold_up(pos.y - screen.top(), screen.bottom() - (pos.y + row_size.y));
         let shown = egui::Area::new(strip_id()).order(egui::Order::Foreground).fixed_pos(pos).show(ctx, |ui| {
             scale_text(ui, s);
-            strip_frame()
+            strip_frame(s)
                 .show(ui, |ui| {
-                    ui.set_width(width - 2.0 * BAR_MARGIN);
+                    ui.set_width(width - 2.0 * BAR_MARGIN * s);
                     let row = ui.horizontal(|ui| {
-                        let grip = strip_grip(ui, SEARCH_FIELD_HEIGHT * s).on_hover_text(tr!("drag to move", "arrastar para mover"));
+                        let grip = strip_grip(ui, SEARCH_FIELD_HEIGHT * s, s).on_hover_text(tr!("drag to move", "arrastar para mover"));
                         if grip.dragged() {
                             out.drag += grip.drag_delta();
                         }
@@ -2604,20 +3385,13 @@ impl Overlay {
                         }
                         let size = BODY * SEARCH_FIELD_TEXT * s;
                         let mut text = self.search.text.clone();
-                        // A field at a glance over a dark scene: lighter than the strip, with a
-                        // visible border (cyan and thicker with the keyboard). Only the field
-                        // comes after this in the row.
-                        let v = ui.visuals_mut();
-                        v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, FIELD_BORDER);
-                        v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, ACCENT.gamma_multiply(0.8));
-                        v.selection.stroke = egui::Stroke::new(2.0_f32, ACCENT);
-                        let field = egui::TextEdit::singleline(&mut text)
+                        // A field at a glance over a dark scene (see `light_field`). Only the
+                        // field comes after this in the row.
+                        light_field_strokes(ui);
+                        let field = light_field(&mut text, RichText::new(tr!("Search items and missions…", "Buscar itens e missões…")).size(size))
                             .id(search_id())
                             .font(egui::FontId::proportional(size))
-                            .text_color(TEXT_BRIGHT)
-                            .background_color(FIELD)
-                            .hint_text(RichText::new(tr!("Search items and missions…", "Buscar itens e missões…")).color(FIELD_HINT).size(size))
-                            .margin(6.0)
+                            .margin(6.0 * s)
                             .min_size(egui::vec2(0.0, SEARCH_FIELD_HEIGHT * s))
                             .desired_width(f32::INFINITY);
                         if ui.add(field).changed() {
@@ -2655,11 +3429,11 @@ impl Overlay {
                         });
                         bottom = chips_row.response.rect.bottom();
                     }
-                    out.bottom = bottom + BAR_MARGIN;
+                    out.bottom = bottom + BAR_MARGIN * s;
                     let unfold = listing != Listing::Nothing;
                     if unfold && !up {
                         ui.add_space(4.0 * s);
-                        let max = (screen.bottom() - ui.cursor().top() - BAR_MARGIN - SCREEN_GAP).max(3.0 * MIN_BODY);
+                        let max = (screen.bottom() - ui.cursor().top() - BAR_MARGIN * s - SCREEN_GAP).max(3.0 * MIN_BODY);
                         results_scroll(ui, max, |ui| self.search_results(ui, &listing, results.as_ref(), filter, &mut out.actions));
                     }
                     (listing, results, filter, unfold)
@@ -2672,15 +3446,15 @@ impl Overlay {
         let (listing, results, filter, unfold) = shown.inner;
         if unfold && up {
             // Above the strip, in an area of its own whose bottom stays put.
-            let max = (rect.top() - UNFOLD_GAP - screen.top() - SCREEN_GAP - 2.0 * BAR_MARGIN).max(3.0 * MIN_BODY);
+            let max = (rect.top() - UNFOLD_GAP - screen.top() - SCREEN_GAP - 2.0 * BAR_MARGIN * s).max(3.0 * MIN_BODY);
             egui::Area::new(results_up_id())
                 .order(egui::Order::Foreground)
                 .pivot(egui::Align2::LEFT_BOTTOM)
                 .fixed_pos(egui::pos2(rect.left(), rect.top() - UNFOLD_GAP))
                 .show(ctx, |ui| {
                     scale_text(ui, s);
-                    strip_frame().show(ui, |ui| {
-                        ui.set_width(width - 2.0 * BAR_MARGIN);
+                    strip_frame(s).show(ui, |ui| {
+                        ui.set_width(width - 2.0 * BAR_MARGIN * s);
                         results_scroll(ui, max, |ui| self.search_results(ui, &listing, results.as_ref(), filter, &mut out.actions));
                     });
                 });
@@ -2864,8 +3638,10 @@ impl Overlay {
         });
     }
 
-    /// Open, the widgets menu under its button (`button`): a switch per card, for the search
-    /// and for the alerts, "voltar ao lugar" for the search, "mostrar todos" and "ocultar todos".
+    /// Open, the widgets menu under its button (`button`): a switch per card (but the
+    /// blueprints card, which has its own button in the bar), for the search and for the
+    /// alerts, "voltar ao lugar" for the search, "mostrar todos" and "ocultar todos" (every
+    /// widget, the blueprints card included).
     fn widgets_menu(&self, ctx: &egui::Context, button: egui::Rect) -> MenuOut {
         let mut out = MenuOut::default();
         let all_on = Part::ALL.iter().all(|p| self.shown.get(*p));
@@ -2873,7 +3649,7 @@ impl Overlay {
             card_frame(true).show(ui, |ui| {
                 ui.set_min_width(MENU_WIDTH);
                 ui.horizontal(|ui| card_title(ui, "Widgets", None, 1.0));
-                for part in Part::ALL {
+                for part in Part::ALL.into_iter().filter(|p| p.in_menu()) {
                     ui.push_id(part.key(), |ui| {
                         ui.horizontal(|ui| {
                             let on = self.shown.get(part);
@@ -2929,63 +3705,73 @@ impl Overlay {
     }
 
     /// The bar on top while open: wordmark, channel, location, opacity, text size, the
-    /// widgets menu, "Ocultar" (hides everything, never ends the process), close; the keys
-    /// under it.
+    /// blueprints card's button, the widgets menu, "Ocultar" (hides everything, never ends the
+    /// process), close; the keys under it. Everything in it grows with the text size, like
+    /// the cards.
     fn bar(&mut self, ctx: &egui::Context) -> BarOut {
         let mut out = BarOut::default();
         let mut opacity = self.opacity;
         let mut scale = self.text_scale;
+        // The size this frame is drawn at (a step of "A-" / "A+" shows from the next frame).
+        let s = self.text_scale;
+        let bp_shown = self.shown.get(Part::Card(Widget::Blueprints));
+        let mut bp_toggle = false;
         let frame = egui::Frame::new()
             .fill(NAVY.gamma_multiply(0.96))
             .stroke(egui::Stroke::new(1.0_f32, ACCENT.gamma_multiply(0.6)))
             .corner_radius(6.0)
-            .inner_margin(BAR_MARGIN);
+            .inner_margin(BAR_MARGIN * s);
         let shown = egui::Area::new(egui::Id::new("wikelist-bar")).order(egui::Order::Foreground).anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 12.0)).show(ctx, |ui| {
+            // The bar's own text and row height (the buttons, the place) follow the text size.
+            scale_text(ui, s);
             frame.show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Wikelist").color(ACCENT).strong().size(17.0));
+                    ui.label(RichText::new("Wikelist").color(ACCENT).strong().size(17.0 * s));
                     if let Some(d) = &self.view
                         && !d.channel.is_empty()
                     {
-                        ui.label(RichText::new(&d.channel).color(MUTED).size(SMALL));
+                        ui.label(RichText::new(&d.channel).color(MUTED).size(SMALL * s));
                     }
                     ui.separator();
                     match self.view.as_ref().and_then(model::current_place) {
                         Some(place) => ui.label(RichText::new(place).color(TEXT).strong()),
-                        None => ui.label(RichText::new(tr!("unknown location", "local desconhecido")).color(MUTED).size(SMALL)),
+                        None => ui.label(RichText::new(tr!("unknown location", "local desconhecido")).color(MUTED).size(SMALL * s)),
                     };
                     ui.separator();
-                    ui.label(RichText::new(tr!("opacity", "opacidade")).color(MUTED).size(SMALL));
-                    ui.spacing_mut().slider_width = 90.0;
+                    ui.label(RichText::new(tr!("opacity", "opacidade")).color(MUTED).size(SMALL * s));
+                    ui.spacing_mut().slider_width = 90.0 * s;
                     let slider = ui.add(egui::Slider::new(&mut opacity, widgets::MIN_OPACITY..=1.0).show_value(false)).on_hover_text(tr!("Of the pinned cards, with the overlay closed", "Dos cartões fixados, com o overlay fechado"));
                     out.preview = slider.hovered() || slider.dragged();
                     out.opacity_done = slider.drag_stopped() || (slider.changed() && !slider.dragged());
                     ui.separator();
-                    ui.label(RichText::new(tr!("text", "texto")).color(MUTED).size(SMALL));
-                    let smaller = ui.add_enabled(scale > widgets::TEXT_SCALES[0], egui::Button::new(RichText::new("A-").size(SMALL))).on_hover_text(tr!("smaller text", "texto menor"));
+                    ui.label(RichText::new(tr!("text", "texto")).color(MUTED).size(SMALL * s));
+                    let smaller = ui.add_enabled(scale > widgets::TEXT_SCALES[0], egui::Button::new(RichText::new("A-").size(SMALL * s))).on_hover_text(tr!("smaller text", "texto menor"));
                     if smaller.clicked() {
                         scale = widgets::text_scale_step(scale, false);
                     }
-                    ui.label(RichText::new(widgets::text_scale_label(scale)).color(TEXT).size(SMALL));
-                    let larger = ui.add_enabled(scale < widgets::TEXT_SCALES[widgets::TEXT_SCALES.len() - 1], egui::Button::new(RichText::new("A+").size(SMALL))).on_hover_text(tr!("larger text", "texto maior"));
+                    ui.label(RichText::new(widgets::text_scale_label(scale)).color(TEXT).size(SMALL * s));
+                    let larger = ui.add_enabled(scale < widgets::TEXT_SCALES[widgets::TEXT_SCALES.len() - 1], egui::Button::new(RichText::new("A+").size(SMALL * s))).on_hover_text(tr!("larger text", "texto maior"));
                     if larger.clicked() {
                         scale = widgets::text_scale_step(scale, true);
                     }
                     ui.separator();
-                    let menu = ui.add(egui::Button::new(RichText::new("Widgets").size(SMALL)).selected(self.menu_open)).on_hover_text(tr!("Show / hide each card, the search and the alerts", "Mostrar / ocultar cada cartão, a busca e os alertas"));
+                    // The blueprints card is shown and hidden here, not in the widgets menu.
+                    let hint = if bp_shown { tr!("Blueprints: click to hide the card", "Blueprints: clique para ocultar o cartão") } else { tr!("Blueprints: click to show the card", "Blueprints: clique para mostrar o cartão") };
+                    bp_toggle = blueprints_button(ui, bp_shown, s).on_hover_text(hint).clicked();
+                    let menu = ui.add(egui::Button::new(RichText::new("Widgets").size(SMALL * s)).selected(self.menu_open)).on_hover_text(tr!("Show / hide each card, the search and the alerts", "Mostrar / ocultar cada cartão, a busca e os alertas"));
                     out.menu_button = Some(menu.rect);
                     out.menu_toggle = menu.clicked();
                     ui.separator();
                     // Hides, never ends: the process stays and the hotkey or the tray brings it back.
-                    if ui.add(egui::Button::new(RichText::new(tr!("Hide", "Ocultar")).size(SMALL))).on_hover_text(hide_hint()).clicked() {
+                    if ui.add(egui::Button::new(RichText::new(tr!("Hide", "Ocultar")).size(SMALL * s))).on_hover_text(hide_hint()).clicked() {
                         out.hide = true;
                     }
-                    if ui.add(egui::Button::new(RichText::new("×").size(16.0)).frame(false)).on_hover_text(tr!("close (Esc)", "fechar (Esc)")).clicked() {
+                    if ui.add(egui::Button::new(RichText::new("×").size(16.0 * s)).frame(false)).on_hover_text(tr!("close (Esc)", "fechar (Esc)")).clicked() {
                         out.close = true;
                     }
                 });
-                ui.label(RichText::new(hotkey::help()).color(MUTED).size(11.0));
-                self.status_lines(ui, true);
+                ui.label(RichText::new(hotkey::help()).color(MUTED).size(11.0 * s));
+                self.status_lines(ui, true, s);
             });
         });
         out.rect = Some(shown.response.rect);
@@ -2996,14 +3782,17 @@ impl Overlay {
         // A text size step is a finished change, like a released slider.
         let scaled = scale != self.text_scale;
         self.text_scale = scale;
-        if out.opacity_done || scaled {
+        // The blueprints button flips the same switch as the card's ✕ and the menu did.
+        let toggled = bp_toggle && self.shown.set(Part::Card(Widget::Blueprints), !bp_shown);
+        if out.opacity_done || scaled || toggled {
             self.commit(ctx);
         }
         out
     }
 
-    /// Connection problems and, with `keys`, the keys another program holds.
-    fn status_lines(&self, ui: &mut egui::Ui, keys: bool) {
+    /// Connection problems and, with `keys`, the keys another program holds; `s` is the text
+    /// size.
+    fn status_lines(&self, ui: &mut egui::Ui, keys: bool, s: f32) {
         match &self.conn {
             Conn::Ok | Conn::Loading => {}
             Conn::SignedOut => {
@@ -3013,12 +3802,12 @@ impl Overlay {
                 ui.label(RichText::new(tr!("the server has no overlay yet", "o servidor ainda não tem o overlay")).color(MUTED));
             }
             Conn::Unreachable(e) => {
-                ui.label(RichText::new(no_contact()).color(MUTED).size(SMALL)).on_hover_text(e);
+                ui.label(RichText::new(no_contact()).color(MUTED).size(SMALL * s)).on_hover_text(e);
             }
         }
         if keys {
             for f in &self.hotkeys.failed {
-                ui.add(egui::Label::new(RichText::new(f).color(WARN).size(11.0)).wrap());
+                ui.add(egui::Label::new(RichText::new(f).color(WARN).size(11.0 * s)).wrap());
             }
         }
     }
@@ -3043,7 +3832,7 @@ impl Overlay {
             .interactable(false)
             .show(ctx, |ui| {
                 ui.set_opacity(self.opacity);
-                card_frame(false).show(ui, |ui| self.status_lines(ui, false));
+                card_frame(false).show(ui, |ui| self.status_lines(ui, false, 1.0));
             });
     }
 
@@ -3145,7 +3934,7 @@ impl eframe::App for Overlay {
             let bar = self.bar(ctx);
             self.preview_opacity = bar.preview;
             let screen = ctx.screen_rect();
-            let bar_rect = bar.rect.unwrap_or_else(|| egui::Rect::from_min_size(screen.min, egui::vec2(0.0, 60.0)));
+            let bar_rect = bar.rect.unwrap_or_else(|| egui::Rect::from_min_size(screen.min, egui::vec2(0.0, 60.0 * self.text_scale)));
             // The reward choices go under the strip in its first place, else under the bar.
             let mut top = bar_rect.bottom() + 10.0 - screen.top();
             let mut strip_up = false;
@@ -3309,13 +4098,85 @@ fn resize_grip(ui: &mut egui::Ui, card: egui::Rect, out: &mut CardOut) {
     }
 }
 
-/// The frame of the search strip and of its results unfolded upwards (the bar's look).
-fn strip_frame() -> egui::Frame {
+/// The frame of the search strip and of its results unfolded upwards (the bar's look, its
+/// margin growing with the text size `s`).
+fn strip_frame(s: f32) -> egui::Frame {
     egui::Frame::new()
         .fill(NAVY.gamma_multiply(0.96))
         .stroke(egui::Stroke::new(1.0_f32, ACCENT.gamma_multiply(0.6)))
         .corner_radius(6.0)
-        .inner_margin(BAR_MARGIN)
+        .inner_margin(BAR_MARGIN * s)
+}
+
+/// A search field read at a glance over a dark scene: lighter than the frame around it
+/// (`FIELD`), bright text, a dim hint (`hint`, its colour set here). The overlay's main search
+/// and the blueprints card's share it; see [`light_field_strokes`] for its border.
+fn light_field(text: &mut String, hint: RichText) -> egui::TextEdit<'_> {
+    egui::TextEdit::singleline(text).text_color(TEXT_BRIGHT).background_color(FIELD).hint_text(hint.color(FIELD_HINT))
+}
+
+/// The border of a [`light_field`]: visible at rest, cyan when hovered, thicker and cyan with
+/// the keyboard. It applies to what `ui` adds after it: call it right before the field (in a
+/// scope of its own when more follows).
+fn light_field_strokes(ui: &mut egui::Ui) {
+    let v = ui.visuals_mut();
+    v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, FIELD_BORDER);
+    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, ACCENT.gamma_multiply(0.8));
+    v.selection.stroke = egui::Stroke::new(2.0_f32, ACCENT);
+}
+
+/// The ✕ of a card's header (`side` px square), drawn with two strokes (no glyph that a font
+/// might lack): muted, bright when hovered.
+fn close_button(ui: &mut egui::Ui, side: f32) -> egui::Response {
+    let (rect, r) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::click());
+    if r.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let color = if r.hovered() { TEXT_BRIGHT } else { MUTED };
+    let c = rect.center();
+    let h = side * 0.3;
+    let stroke = egui::Stroke::new((side / 9.0).max(1.2), color);
+    let painter = ui.painter();
+    painter.line_segment([c + egui::vec2(-h, -h), c + egui::vec2(h, h)], stroke);
+    painter.line_segment([c + egui::vec2(-h, h), c + egui::vec2(h, -h)], stroke);
+    r
+}
+
+/// The bar's button of the blueprints card: a small blueprint sheet (a page with its top
+/// right corner folded and three lines on it) drawn with the painter, `s` the text size.
+/// Selected-looking (lit background, cyan sheet) while the card is shown (`on`).
+fn blueprints_button(ui: &mut egui::Ui, on: bool, s: f32) -> egui::Response {
+    let height = ui.spacing().interact_size.y.max(20.0 * s);
+    let (rect, r) = ui.allocate_exact_size(egui::vec2(26.0 * s, height), egui::Sense::click());
+    if r.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let painter = ui.painter();
+    if on || r.hovered() {
+        painter.rect_filled(rect, 3.0, ACCENT.gamma_multiply(if on { 0.22 } else { 0.1 }));
+    }
+    let color = if on { ACCENT } else if r.hovered() { TEXT_BRIGHT } else { MUTED };
+    let stroke = egui::Stroke::new(1.2 * s.max(1.0), color);
+    // The page: 12 x 15 px at the normal size, centred.
+    let (w, h) = (12.0 * s, 15.0 * s);
+    let page = egui::Rect::from_center_size(rect.center(), egui::vec2(w, h));
+    let fold = 4.0 * s;
+    let (l, t, rt, b) = (page.left(), page.top(), page.right(), page.bottom());
+    let outline = [egui::pos2(l, t), egui::pos2(rt - fold, t), egui::pos2(rt, t + fold), egui::pos2(rt, b), egui::pos2(l, b)];
+    painter.add(egui::Shape::convex_polygon(outline.to_vec(), NAVY, egui::Stroke::NONE));
+    for (i, p) in outline.iter().enumerate() {
+        painter.line_segment([*p, outline[(i + 1) % outline.len()]], stroke);
+    }
+    // The folded corner.
+    painter.line_segment([egui::pos2(rt - fold, t), egui::pos2(rt - fold, t + fold)], stroke);
+    painter.line_segment([egui::pos2(rt - fold, t + fold), egui::pos2(rt, t + fold)], stroke);
+    // Three lines of the drawing.
+    let thin = egui::Stroke::new(1.0_f32, color);
+    for k in 1..=3 {
+        let y = t + fold + k as f32 * (h - fold) / 4.0;
+        painter.line_segment([egui::pos2(l + 2.5 * s, y), egui::pos2(rt - 2.5 * s, y)], thin);
+    }
+    r
 }
 
 /// The search results' scroll area: as tall as they are up to `max`, scrolling beyond.
@@ -3325,9 +4186,10 @@ fn results_scroll(ui: &mut egui::Ui, max: f32, add: impl FnOnce(&mut egui::Ui)) 
     egui::ScrollArea::vertical().max_height(max).min_scrolled_height(max).auto_shrink([false, true]).show(ui, add);
 }
 
-/// The grip the search strip is dragged by (`height` tall): two columns of dots.
-fn strip_grip(ui: &mut egui::Ui, height: f32) -> egui::Response {
-    let (rect, r) = ui.allocate_exact_size(egui::vec2(STRIP_GRIP, height), egui::Sense::drag());
+/// The grip the search strip is dragged by (`height` tall, as wide as the text size `s`
+/// makes it): two columns of dots.
+fn strip_grip(ui: &mut egui::Ui, height: f32, s: f32) -> egui::Response {
+    let (rect, r) = ui.allocate_exact_size(egui::vec2(STRIP_GRIP * s, height), egui::Sense::drag());
     if r.dragged() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
     } else if r.hovered() {
@@ -3549,6 +4411,62 @@ mod tests {
         // A long id goes whole (the overlay only sends ids within `model::MAX_ID_CHARS`).
         let long = "x".repeat(model::MAX_ID_CHARS);
         assert_eq!(w(Local::UnpinItem { item_id: long.clone() }).path, format!("/api/channels/LI%20VE/item-pins/{long}"));
+    }
+
+    #[test]
+    fn a_blueprint_detail_is_asked_for_with_its_key_percent_encoded() {
+        assert_eq!(detail_path("LIVE", "BP_CRAFT_behr_rifle_ballistic_01"), "/api/channels/LIVE/overlay/blueprint/BP_CRAFT_behr_rifle_ballistic_01");
+        assert_eq!(detail_path("LI VE", "BP_a.b-c"), "/api/channels/LI%20VE/overlay/blueprint/BP_a.b-c", "the channel encoded like every segment");
+        // `..` is a key the route's pattern allows (see `model::blueprint_usable`): encoded
+        // whole, so no URL normalisation turns it into a step up.
+        assert!(model::blueprint_usable(".."));
+        assert_eq!(detail_path("LIVE", ".."), "/api/channels/LIVE/overlay/blueprint/%2E%2E");
+        assert_eq!(detail_path("LIVE", "a b/c"), "/api/channels/LIVE/overlay/blueprint/a%20b%2Fc", "never sent (see `fetch_detail`), still encoded");
+    }
+
+    #[test]
+    fn the_detail_answer_is_read_like_the_others() {
+        let body = br#"{"blueprint":"BP_a","name":"A","craftTimeSec":90,"slots":[],"sources":[{"title":"T","when":"accept","chance":0.5}],"sourcesMore":0}"#;
+        match detail_answer(200, body, false, Some("\"d1\"".into()), None) {
+            DetailAnswer::Data(d, etag) => assert_eq!((d.craft_time_sec, d.sources.len(), etag.as_deref()), (90.0, 1, Some("\"d1\""))),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(detail_answer(200, body, false, Some(" ".into()), None), DetailAnswer::Data(_, None)), "a blank ETag is none");
+        assert_eq!(detail_answer(304, b"", true, None, None), DetailAnswer::NotModified);
+        assert_eq!(detail_answer(304, b"", false, None, None), DetailAnswer::Failed(unexpected_304().into(), None), "a 304 without an ETag sent keeps nothing");
+        assert!(matches!(detail_answer(401, b"", true, None, None), DetailAnswer::Failed(e, None) if e.contains("Entre")));
+        assert!(matches!(detail_answer(404, r#"{"error":"blueprint desconhecida"}"#.as_bytes(), false, None, None), DetailAnswer::Failed(e, None) if e == "blueprint desconhecida"), "the server's sentence");
+        assert!(matches!(detail_answer(404, b"", false, None, None), DetailAnswer::Failed(e, None) if e.contains("ainda não")), "a server without the route");
+        assert!(matches!(detail_answer(400, r#"{"error":"nome inválido"}"#.as_bytes(), false, None, None), DetailAnswer::Failed(e, None) if e == "nome inválido"));
+        let wait = Some(Duration::from_secs(5));
+        assert!(matches!(detail_answer(429, b"", true, None, wait), DetailAnswer::Failed(_, Some(Limit(w))) if w == wait), "a 429 holds the details back");
+        assert!(matches!(detail_answer(200, b"[]", false, None, None), DetailAnswer::Failed(_, None)), "not a detail");
+    }
+
+    #[test]
+    fn a_missions_blueprints_are_asked_for_with_its_contract_percent_encoded() {
+        assert_eq!(mission_path("LIVE", "rayari_research_01"), "/api/channels/LIVE/overlay/mission/rayari_research_01/blueprints");
+        assert_eq!(mission_path("LI VE", "a b?c#d"), "/api/channels/LI%20VE/overlay/mission/a%20b%3Fc%23d/blueprints", "every segment encoded");
+        assert_eq!(mission_path("LIVE", ".."), "/api/channels/LIVE/overlay/mission/%2E%2E/blueprints", "never a step up");
+        assert!(!model::contract_usable("a/b") && !model::contract_usable(""), "never sent (see `fetch_mission`)");
+    }
+
+    #[test]
+    fn the_mission_answer_is_read_like_the_detail() {
+        let body = br#"{"title":"T","giver":null,"pools":[{"when":"complete","poolChance":0.25,"total":2,"acquired":1,"blueprints":[{"blueprint":"BP_a","name":"A","kind":"Weapon","acquired":true}]}]}"#;
+        match mission_answer(200, body, false, Some("\"m1\"".into()), None) {
+            MissionAnswer::Data(m, etag) => assert_eq!((m.title.as_str(), m.pools.len(), m.pools[0].pool_chance, etag.as_deref()), ("T", 1, Some(0.25), Some("\"m1\""))),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(mission_answer(304, b"", true, None, None), MissionAnswer::NotModified);
+        assert_eq!(mission_answer(304, b"", false, None, None), MissionAnswer::Failed(unexpected_304().into(), None), "a 304 without an ETag sent keeps nothing");
+        assert!(matches!(mission_answer(401, b"", true, None, None), MissionAnswer::Failed(e, None) if e.contains("Entre")));
+        assert!(matches!(mission_answer(404, b"", false, None, None), MissionAnswer::Failed(e, None) if e == "O site ainda não tem as blueprints por missão."), "a server without the route");
+        assert!(matches!(mission_answer(404, r#"{"error":"missão desconhecida"}"#.as_bytes(), false, None, None), MissionAnswer::Failed(e, None) if e == "missão desconhecida"), "the server's sentence");
+        assert!(matches!(mission_answer(400, r#"{"error":"contrato inválido"}"#.as_bytes(), false, None, None), MissionAnswer::Failed(e, None) if e == "contrato inválido"));
+        let wait = Some(Duration::from_secs(5));
+        assert!(matches!(mission_answer(429, b"", true, None, wait), MissionAnswer::Failed(_, Some(Limit(w))) if w == wait), "a 429 holds the details and missions back");
+        assert!(matches!(mission_answer(200, b"[]", false, None, None), MissionAnswer::Failed(_, None)), "not a mission");
     }
 
     #[test]

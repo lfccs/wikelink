@@ -6,6 +6,8 @@
 //! window never does the watching itself: it drives the same background process the
 //! command line uses and reads the small status file that process keeps current.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
@@ -25,14 +27,18 @@ const SIZE_SIGNED_IN: [f32; 2] = [560.0, 820.0];
 
 /// Result of a background action (network or waiting for the process).
 enum Done {
-    /// handle, token, display name
-    Login(Result<(String, String, String), String>),
+    /// The site gave a code for sign-in attempt number `.0`, or why not.
+    LinkStarted(u64, Result<agent::LinkCode, agent::LinkError>),
+    /// Sign-in attempt number `.0` ended (from its polling thread, not `App::spawn`).
+    Linked(u64, agent::LinkOutcome),
     /// Saved session re-checked at start: display name when still valid.
     Session(Result<Option<String>, String>),
     Started(Result<u32, String>),
     Stopped(Result<bool, String>),
     Autostart(bool, Result<(), String>),
-    LoggedOut,
+    /// The sign-out ended: the saved session was removed, or why it could not be (then this
+    /// PC is still signed in).
+    LoggedOut(Result<(), String>),
     /// A newer release the server knows of: (version, download page).
     Update(Option<(String, String)>),
     /// The overlay was opened or closed.
@@ -41,6 +47,16 @@ enum Done {
     UpdateProgress(String),
     /// The update ended: done, or why not.
     Updated(Result<update::Finished, String>),
+}
+
+/// The session token of a sign-in that ended for attempt `attempt` while `current` is the
+/// window's current attempt: `Some` only for a session whose attempt was cancelled or replaced
+/// since, which the window does not keep. Pure.
+fn orphan_token(attempt: u64, current: u64, outcome: &agent::LinkOutcome) -> Option<String> {
+    match outcome {
+        agent::LinkOutcome::SignedIn(s) if attempt != current => Some(s.token.clone()),
+        _ => None,
+    }
 }
 
 /// The "Update" button of the new-version banner, step by step. Nothing is downloaded before
@@ -118,10 +134,28 @@ pub(crate) fn setup_style(ctx: &egui::Context) {
     });
 }
 
+/// A sign-in through the site waiting for the player's confirmation in the browser.
+struct Linking {
+    /// What the player compares with the site.
+    code: String,
+    /// `<server>/link` (see `agent::link_page`), for "Open the page again".
+    page: String,
+    /// Set by "Cancel": the polling thread stops at its next look.
+    cancel: Arc<AtomicBool>,
+    /// When "Copy code" last put the code on the clipboard ("copied" shows for a moment).
+    copied: Option<Instant>,
+}
+
+/// How long "copied" shows after "Copy code".
+const COPIED_FOR: Duration = Duration::from_secs(2);
+
 struct App {
     cfg: AgentConfig,
-    handle_in: String,
-    password_in: String,
+    /// The sign-in through the site under way, once the site gave its code.
+    linking: Option<Linking>,
+    /// Number of the latest sign-in attempt: what comes back for an older (cancelled) one is
+    /// ignored.
+    link_attempt: u64,
     installs: Vec<wikelo_install::InstallInfo>,
     running: Option<u32>,
     /// The overlay is on (its mutex exists): over the game, or waiting for it.
@@ -158,9 +192,9 @@ impl App {
         // executable, so the old program no longer starts at sign-in next to this one.
         let migrated = agent::migrate_autostart().map_err(|e| format!("{e:#}"));
         let mut app = Self {
-            handle_in: cfg.handle.clone(),
-            password_in: String::new(),
             cfg,
+            linking: None,
+            link_attempt: 0,
             installs: wikelo_install::discover_installs(&[]).into_iter().filter(|i| i.game_log_path.exists() || i.has_p4k()).collect(),
             running: None,
             overlay_open: false,
@@ -227,35 +261,36 @@ impl App {
         while let Ok(done) = self.rx.try_recv() {
             let before = self.busy.take();
             match done {
-                Done::Login(Ok((handle, token, name))) => {
-                    // The address the new token belongs to (see `agent::with_token_rule`).
-                    self.cfg.server = agent::server_address().to_string();
-                    self.cfg.handle = handle;
-                    self.cfg.token = token;
-                    self.cfg.name = Some(name.clone());
-                    if self.cfg.share_data.is_none() {
-                        self.cfg.share_data = Some(true);
-                    }
-                    self.password_in.clear();
-                    self.msg = None;
-                    let mine = &self.cfg;
-                    let written = agent::update_config(mine, |d| {
-                        agent::copy_sign_in(d, mine);
-                        if d.share_data.is_none() {
-                            d.share_data = mine.share_data;
+                Done::LinkStarted(attempt, started) => {
+                    if attempt == self.link_attempt {
+                        match started {
+                            Ok(link) => self.follow_link(attempt, link),
+                            Err(e) => self.msg = Some((true, e.to_string())),
                         }
-                    });
-                    match written {
-                        Err(e) => self.msg = Some((true, trf!("could not save the settings: {e}", "não deu para gravar a configuração: {e}"))),
-                        Ok(saved) => {
-                            self.cfg = saved;
-                            if self.running.is_none() {
-                                self.start();
+                    }
+                }
+                Done::Linked(attempt, outcome) => {
+                    // Not from `spawn`: whatever else is busy right now stays so.
+                    self.busy = before;
+                    if let Some(token) = orphan_token(attempt, self.link_attempt, &outcome) {
+                        // A session for an attempt cancelled or replaced since: it is not kept
+                        // here, so it is ended on the server too (best effort, in the
+                        // background), then dropped.
+                        std::thread::spawn(move || {
+                            let _ = agent::sign_out_token(&token);
+                        });
+                    }
+                    if attempt == self.link_attempt {
+                        self.linking = None;
+                        match outcome {
+                            agent::LinkOutcome::SignedIn(s) => self.signed_in_as(s),
+                            other => {
+                                let is_err = other != agent::LinkOutcome::Cancelled;
+                                self.msg = Some((is_err, other.to_string()));
                             }
                         }
                     }
                 }
-                Done::Login(Err(e)) => self.msg = Some((true, e)),
                 Done::Session(Ok(Some(name))) => {
                     if self.cfg.name.as_deref() != Some(&name) {
                         self.cfg.name = Some(name);
@@ -285,11 +320,13 @@ impl App {
                     self.autostart = agent::autostart_enabled();
                     self.msg = Some((true, e));
                 }
-                Done::LoggedOut => {
+                Done::LoggedOut(Ok(())) => {
                     // The language outlives the sign-out (see `agent::remove_config`).
                     self.cfg = AgentConfig { handle: self.cfg.handle.clone(), lang: self.cfg.lang.clone(), ..Default::default() };
                     self.msg = None;
                 }
+                // The saved session is still there: the window stays signed in and says why.
+                Done::LoggedOut(Err(e)) => self.msg = Some((true, e)),
                 Done::Overlay(Ok(())) => {}
                 Done::Overlay(Err(e)) => self.msg = Some((true, e)),
                 Done::Update(u) => {
@@ -333,15 +370,69 @@ impl App {
         });
     }
 
-    fn login(&mut self) {
-        let handle = self.handle_in.trim().to_string();
-        let password = self.password_in.clone();
-        if handle.is_empty() || password.is_empty() {
-            self.msg = Some((true, tr!("fill in user and password", "preencha usuário e senha").into()));
+    /// "Sign in": ask the site for a code; `follow_link` takes it from there.
+    fn sign_in(&mut self) {
+        self.msg = None;
+        self.link_attempt += 1;
+        let attempt = self.link_attempt;
+        self.spawn(tr!("asking the site for a code…", "pedindo um código ao site…"), move || Done::LinkStarted(attempt, agent::link_start()));
+    }
+
+    /// The site gave a code: open its page in the browser and poll on a thread of its own,
+    /// which sends `Done::Linked` at the end. The page is built from Wikelink's own address.
+    fn follow_link(&mut self, attempt: u64, link: agent::LinkCode) {
+        let Some(page) = agent::link_page(&link.code) else {
+            self.msg = Some((true, tr!("unexpected answer from the server", "resposta inesperada do servidor").into()));
             return;
+        };
+        if let Err(e) = open::that_detached(&page) {
+            self.msg = Some((true, trf!("could not open the browser ({e}); open {page}", "não deu para abrir o navegador ({e}); abra {page}")));
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.linking = Some(Linking { code: link.code.clone(), page, cancel: cancel.clone(), copied: None });
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(Done::Linked(attempt, agent::wait_for_link(&link, &cancel)));
+        });
+    }
+
+    /// "Cancel" while waiting for the browser: back to the button at once; the polling thread
+    /// stops at its next look at the switch, and what it sends then is ignored.
+    fn cancel_link(&mut self) {
+        if let Some(l) = self.linking.take() {
+            l.cancel.store(true, Ordering::Relaxed);
+        }
+        self.link_attempt += 1;
+        self.msg = Some((false, agent::LinkOutcome::Cancelled.to_string()));
+    }
+
+    /// The site confirmed the sign-in: keep the session and start the watcher.
+    fn signed_in_as(&mut self, s: agent::SignIn) {
+        // The address the new token belongs to (see `agent::with_token_rule`).
+        self.cfg.server = agent::server_address().to_string();
+        self.cfg.handle = s.handle;
+        self.cfg.token = s.token;
+        self.cfg.name = Some(s.name);
+        if self.cfg.share_data.is_none() {
+            self.cfg.share_data = Some(true);
         }
         self.msg = None;
-        self.spawn(tr!("signing in…", "entrando…"), move || Done::Login(agent::login(&handle, &password).map(|(token, name)| (handle, token, name)).map_err(|e| format!("{e:#}"))));
+        let mine = &self.cfg;
+        let written = agent::update_config(mine, |d| {
+            agent::copy_sign_in(d, mine);
+            if d.share_data.is_none() {
+                d.share_data = mine.share_data;
+            }
+        });
+        match written {
+            Err(e) => self.msg = Some((true, trf!("could not save the settings: {e}", "não deu para gravar a configuração: {e}"))),
+            Ok(saved) => {
+                self.cfg = saved;
+                if self.running.is_none() {
+                    self.start();
+                }
+            }
+        }
     }
 
     /// The background watcher brings the overlay up itself (see `agent::OverlayKeeper`).
@@ -413,8 +504,19 @@ impl App {
             // later without an account.
             let _ = agent::close_overlay();
             let _ = agent::stop_background();
-            let _ = agent::remove_config();
-            Done::LoggedOut
+            // The server ends the session too (best effort, a few seconds at most); the
+            // session on this PC is forgotten whatever it answers.
+            if let Some(cfg) = agent::load_config() {
+                let _ = agent::sign_out_on_server(&cfg);
+            }
+            let p = agent::config_path();
+            let shown = p.display();
+            Done::LoggedOut(agent::remove_config().map_err(|e| {
+                trf!(
+                    "could not remove the saved session ({shown}): {e}; this PC is still signed in",
+                    "não deu para remover a sessão salva ({shown}): {e}; este PC continua conectado"
+                )
+            }))
         });
     }
 
@@ -592,24 +694,45 @@ impl App {
                         self.logout();
                     }
                 });
-            } else {
-                let mut submit = false;
-                egui::Grid::new("login").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
-                    ui.label(tr!("User", "Usuário"));
-                    let r = ui.add(egui::TextEdit::singleline(&mut self.handle_in).hint_text(tr!("the same as on the site", "o mesmo do site")).desired_width(f32::INFINITY));
-                    submit |= r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    ui.end_row();
-                    ui.label(tr!("Password", "Senha"));
-                    let r = ui.add(egui::TextEdit::singleline(&mut self.password_in).password(true).desired_width(f32::INFINITY));
-                    submit |= r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    ui.end_row();
+            } else if let Some((code, page, copied)) = self.linking.as_ref().map(|l| (l.code.clone(), l.page.clone(), l.copied)) {
+                // Waiting for the browser: the code to compare, and the two ways out.
+                ui.label(RichText::new(tr!("Confirm this code on the site:", "Confirme este código no site:")).color(MUTED));
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&code).monospace().strong().size(26.0).color(TEXT));
+                    // The code exactly as shown, through egui's clipboard; nothing else is copied.
+                    if ui.button(tr!("Copy code", "Copiar código")).clicked() {
+                        ui.ctx().copy_text(code.clone());
+                        if let Some(l) = self.linking.as_mut() {
+                            l.copied = Some(Instant::now());
+                        }
+                        ui.ctx().request_repaint();
+                    }
+                    if let Some(left) = copied.and_then(|at| COPIED_FOR.checked_sub(at.elapsed())) {
+                        ui.label(RichText::new(tr!("copied", "copiado")).color(OK));
+                        // Gone once its time is up.
+                        ui.ctx().request_repaint_after(left);
+                    }
                 });
                 ui.horizontal(|ui| {
-                    let can = self.busy.is_none() && !self.handle_in.trim().is_empty() && !self.password_in.is_empty();
-                    if ui.add_enabled(can, egui::Button::new(tr!("Sign in", "Entrar"))).clicked() || (submit && can) {
-                        self.login();
+                    ui.spinner();
+                    ui.label(RichText::new(tr!("Type this code on the site, in the browser…", "Digite este código no site, no navegador…")).color(MUTED));
+                });
+                let mut cancel = false;
+                ui.horizontal(|ui| {
+                    if ui.button(tr!("Open the page again", "Abrir a página de novo")).on_hover_text(page.clone()).clicked() {
+                        let _ = open::that_detached(&page);
                     }
-                    ui.label(RichText::new(tr!("Same account as on wikelist.net. Wikelink starts as soon as you sign in.", "A conta é a mesma do wikelist.net. O Wikelink começa assim que você entrar.")).color(MUTED).small());
+                    cancel = ui.button(tr!("Cancel", "Cancelar")).clicked();
+                });
+                if cancel {
+                    self.cancel_link();
+                }
+            } else {
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(self.busy.is_none(), egui::Button::new(tr!("Sign in", "Entrar"))).clicked() {
+                        self.sign_in();
+                    }
+                    ui.label(RichText::new(tr!("Opens the site in the browser, where you type the code shown here. Wikelink starts as soon as you sign in.", "Abre o site no navegador, onde você digita o código mostrado aqui. O Wikelink começa assim que você entrar.")).color(MUTED).small());
                 });
             }
             if let Some((is_err, text)) = &self.msg {
@@ -892,4 +1015,22 @@ fn tail(path: &std::path::Path, max: u64) -> String {
         s = s[nl + 1..].to_string();
     }
     s.replace("\r\n", "\n").trim_end().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_session_of_an_older_attempt_is_ended() {
+        let signed = agent::LinkOutcome::SignedIn(agent::SignIn { token: "tok-1".into(), handle: "TestPilot".into(), name: "Test Pilot".into() });
+        // Cancelled (the attempt number moved on) or replaced by a newer attempt.
+        assert_eq!(orphan_token(1, 2, &signed), Some("tok-1".into()));
+        assert_eq!(orphan_token(1, 5, &signed), Some("tok-1".into()));
+        // The current attempt keeps its session; other outcomes carry none.
+        assert_eq!(orphan_token(2, 2, &signed), None);
+        for other in [agent::LinkOutcome::Cancelled, agent::LinkOutcome::Denied, agent::LinkOutcome::Expired] {
+            assert_eq!(orphan_token(1, 2, &other), None);
+        }
+    }
 }

@@ -9,7 +9,7 @@
 //! stop file; `status` checks the pid file). In the background it also keeps an icon in
 //! the notification area (`tray`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -830,6 +830,13 @@ struct Me {
     account: Option<AccountInfo>,
 }
 
+/// The name shown for `a`: its display name, or its handle when it has none (through
+/// [`server_text`]).
+fn account_name(a: &AccountInfo) -> String {
+    let name = server_text(&a.display_name);
+    if name.trim().is_empty() { server_text(&a.handle) } else { name }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 struct KnownDataset {
     channel: String,
@@ -935,11 +942,22 @@ fn http() -> ureq::Agent {
     http_agent(Duration::from_secs(60))
 }
 
-/// The server's `{ "error": … }` text, or `HTTP <status>` when the body has none.
+/// Most characters kept of a text from the server that is printed or saved (a handle, a
+/// display name, an error sentence, a version).
+const SERVER_TEXT_MAX: usize = 200;
+
+/// `s`, a text from the server, as it may be printed in the terminal, shown or saved to
+/// `watcher.json`: control characters removed and at most [`SERVER_TEXT_MAX`] characters.
+pub(crate) fn server_text(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).take(SERVER_TEXT_MAX).collect()
+}
+
+/// The server's `{ "error": … }` text (through [`server_text`]), or `HTTP <status>` when the
+/// body has none.
 pub(crate) fn server_error(status: u16, body: &[u8]) -> String {
     serde_json::from_slice::<serde_json::Value>(body)
         .ok()
-        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(String::from))
+        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(server_text))
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| format!("HTTP {status}"))
 }
@@ -1119,8 +1137,8 @@ impl Client {
     /// The address of `path` on the server. Every request of this program (the watcher, the
     /// sign-in, the overlay) gets its address here, and nothing else builds one. When the base
     /// breaks the transport rule of [`transport_base`] (https, or plain http to this PC only),
-    /// or the token belongs to another address, the answer is the reason, and no token or
-    /// password is sent anywhere.
+    /// or the token belongs to another address, the answer is the reason, and no token is sent
+    /// anywhere.
     fn url(&self, path: &str) -> Result<String, String> {
         self.base.as_ref().map(|base| format!("{base}{path}")).map_err(Clone::clone)
     }
@@ -1129,7 +1147,8 @@ impl Client {
         format!("Bearer {}", self.token)
     }
 
-    /// Display name of the signed-in account, `None` when the token is not accepted.
+    /// Display name of the signed-in account (through [`server_text`]), `None` when the token
+    /// is not accepted.
     fn me(&self) -> Result<Option<String>, SendError> {
         let url = self.url("/api/auth/me").map_err(SendError::Unusable)?;
         if self.token.is_empty() {
@@ -1137,10 +1156,16 @@ impl Client {
         }
         let mut res = check(self.http.get(&url).header("Authorization", &self.auth()).call()?)?;
         let me: Me = read_json_body(&mut res, SMALL_BODY_LIMIT)?;
-        Ok(me.account.map(|a| if a.display_name.is_empty() { a.handle } else { a.display_name }))
+        Ok(me.account.map(|a| account_name(&a)))
     }
 
     fn send(&self, channel: &str, host: &str, share_data: bool, events: &[(bool, TrackerOutput)]) -> Result<Ack, SendError> {
+        self.send_with_status(channel, host, share_data, events).map_err(|(_, e)| e)
+    }
+
+    /// [`Client::send`], keeping the HTTP status of the answer with an error (`None` when no
+    /// answer came: no network, a timeout, an address that may not be used).
+    fn send_with_status(&self, channel: &str, host: &str, share_data: bool, events: &[(bool, TrackerOutput)]) -> Result<Ack, (Option<u16>, SendError)> {
         let body = Batch {
             channel,
             host,
@@ -1149,14 +1174,21 @@ impl Client {
             commit: GIT_COMMIT,
             events: events.iter().map(|(replay, event)| AgentEvent { replay: *replay, event }).collect(),
         };
-        let url = self.url("/api/agent/events").map_err(SendError::Unusable)?;
-        let mut res = self.http.post(&url).header("Authorization", &self.auth()).send_json(&body)?;
-        if res.status().as_u16() == 422 {
+        let url = self.url("/api/agent/events").map_err(|e| (None, SendError::Unusable(e)))?;
+        let mut res = self.http.post(&url).header("Authorization", &self.auth()).send_json(&body).map_err(|e| {
+            let status = match &e {
+                ureq::Error::StatusCode(code) => Some(*code),
+                _ => None,
+            };
+            (status, SendError::from(e))
+        })?;
+        let status = res.status().as_u16();
+        if status == 422 {
             let body = read_body(&mut res, ERROR_BODY_LIMIT).unwrap_or_default();
-            return Err(SendError::Unprocessable(server_error(422, &body)));
+            return Err((Some(422), SendError::Unprocessable(server_error(422, &body))));
         }
-        let mut res = check(res)?;
-        read_json_body(&mut res, SMALL_BODY_LIMIT)
+        let mut res = check(res).map_err(|e| (Some(status), e))?;
+        read_json_body(&mut res, SMALL_BODY_LIMIT).map_err(|e| (Some(status), e))
     }
 
     fn bye(&self) {
@@ -1176,13 +1208,14 @@ impl Client {
     }
 
     /// The newest watcher release the server knows of (`None` when it has not looked yet). Its
-    /// `url` is kept only when it is a page of this project's releases (see [`openable_url`]);
-    /// anything else becomes empty, and no button opens it.
+    /// `version` goes through [`server_text`]; its `url` is kept only when it is a page of this
+    /// project's releases (see [`openable_url`]); anything else becomes empty, and no button
+    /// opens it.
     fn latest_release(&self) -> Result<Option<LatestRelease>, SendError> {
         let url = self.url("/api/watcher/latest").map_err(SendError::Unusable)?;
         let mut res = check(self.http.get(&url).call()?)?;
         let r: LatestResponse = read_json_body(&mut res, SMALL_BODY_LIMIT)?;
-        Ok(r.latest.map(|l| LatestRelease { url: openable_url(&l.url, Link::Release).unwrap_or_default(), ..l }))
+        Ok(r.latest.map(|l| LatestRelease { version: server_text(&l.version), url: openable_url(&l.url, Link::Release).unwrap_or_default() }))
     }
 
     /// Upload a bundle; a refusal comes back as `Rejected` with the server's own words.
@@ -1205,32 +1238,330 @@ pub fn latest_version() -> Result<Option<String>, String> {
     Client::new("", "").latest_release().map(|r| r.map(|l| l.version)).map_err(|e| format!("{e:?}"))
 }
 
-/// Exchange handle + password for a Wikelink session token, at [`server_address`] (the
-/// address the token then belongs to). Returns `(token, display name)`.
-pub fn login(handle: &str, password: &str) -> anyhow::Result<(String, String)> {
-    let client = Client::new("", "");
-    let url = client.url("/api/auth/agent-login").map_err(anyhow::Error::msg)?;
-    let server = server_address();
-    let mut res = client
-        .http
-        .post(&url)
-        .send_json(serde_json::json!({ "handle": handle, "password": password }))
-        .map_err(|e| anyhow::anyhow!(trf!("could not reach {server}: {e}", "não foi possível falar com {server}: {e}")))?;
-    let status = res.status().as_u16();
-    match status {
-        401 => bail!(tr!("wrong user or password", "usuário ou senha incorretos")),
-        404 => bail!(tr!("this server does not support Wikelink (update the server)", "este servidor não tem suporte ao Wikelink (atualize o servidor)")),
-        s if s >= 400 => {
-            // Any other refusal: the server's own words.
-            let body = read_body(&mut res, ERROR_BODY_LIMIT).unwrap_or_default();
-            bail!("{}", server_error(s, &body));
+// ----- sign-in through the site -------------------------------------------------------
+//
+// Wikelink asks the server for a short code (`POST /api/auth/link/start`, with this PC's
+// name), opens `<server>/link` in the browser, where the player, signed in on the
+// site, types the code Wikelink shows and confirms, and meanwhile asks every few seconds
+// (`POST /api/auth/link/poll`, with the secret only this client got) whether it was confirmed.
+// Once it is, the answer carries the session token, as a sign-in did before.
+
+/// Overall timeout of each request of the sign-in through the site.
+const LINK_TIMEOUT: Duration = Duration::from_secs(20);
+/// Longest pause between two polls this client takes from an answer.
+const LINK_MAX_INTERVAL_SECS: u64 = 30;
+/// Longest life of a code this client takes from an answer.
+const LINK_MAX_WAIT_SECS: u64 = 3600;
+/// How often a waiting sign-in looks at its cancel switch.
+const LINK_CANCEL_STEP: Duration = Duration::from_millis(100);
+/// Longest secret taken from an answer (it is sent back as it came).
+const LINK_SECRET_MAX: usize = 256;
+/// The sign-out request gives up after this: signing out on this PC never waits longer.
+const SIGN_OUT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A sign-in through the site that was started: the code the player compares in the browser,
+/// the secret only this client knows (sent back on every poll), how long the code lives and
+/// how long to wait between polls.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkCode {
+    pub code: String,
+    pub secret: String,
+    pub expires_in: Duration,
+    pub interval: Duration,
+}
+
+/// A session the server handed over: the same data the sign-in always gave (token, account).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignIn {
+    pub token: String,
+    pub handle: String,
+    /// Display name of the account, or its handle when it has none.
+    pub name: String,
+}
+
+/// One answer to a poll.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkPoll {
+    /// Nobody confirmed nor refused it yet.
+    Pending,
+    /// Confirmed in the browser: the session for this PC.
+    SignedIn(SignIn),
+    /// Refused in the browser.
+    Denied,
+    /// The code is no longer valid (it expired, or the server does not know it).
+    Expired,
+}
+
+/// Why a request of the sign-in through the site gave no usable answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkError {
+    /// 404: this server has no sign-in through the site.
+    Unsupported,
+    /// 429: the server's own sentence, and the wait it asked for.
+    RateLimited { message: String, retry_after: Option<Duration> },
+    /// No answer (network), another refusal (the server's words) or an answer that does not
+    /// read as it should.
+    Failed(String),
+}
+
+impl std::fmt::Display for LinkError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LinkError::Unsupported => f.write_str(tr!("this server does not support Wikelink (update the server)", "este servidor não tem suporte ao Wikelink (atualize o servidor)")),
+            LinkError::RateLimited { message, .. } => f.write_str(message),
+            LinkError::Failed(m) => f.write_str(m),
         }
-        _ => {}
     }
-    let body = read_body(&mut res, SMALL_BODY_LIMIT).map_err(anyhow::Error::msg)?;
-    let r: LoginResponse = serde_json::from_slice(&body).context(tr!("unexpected answer from the server", "resposta inesperada do servidor"))?;
-    let name = if r.account.display_name.is_empty() { r.account.handle } else { r.account.display_name };
-    Ok((r.token, name))
+}
+
+/// How a sign-in through the site ended (see [`wait_for_link`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkOutcome {
+    SignedIn(SignIn),
+    Denied,
+    Expired,
+    /// The player cancelled it here (the window's "Cancel", Ctrl+C in `watch`).
+    Cancelled,
+    Failed(LinkError),
+}
+
+impl std::fmt::Display for LinkOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LinkOutcome::SignedIn(s) => {
+                let name = &s.name;
+                f.write_str(&trf!("signed in as {name}", "conectado como {name}"))
+            }
+            LinkOutcome::Denied => f.write_str(tr!("the sign-in was refused on the site", "a entrada foi recusada no site")),
+            LinkOutcome::Expired => f.write_str(tr!("the code expired before it was confirmed; sign in again", "o código expirou antes da confirmação; entre de novo")),
+            LinkOutcome::Cancelled => f.write_str(tr!("sign-in cancelled", "entrada cancelada")),
+            LinkOutcome::Failed(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LinkStartResponse {
+    code: String,
+    secret: String,
+    expires_in: u64,
+    interval: u64,
+}
+
+#[derive(Deserialize)]
+struct LinkStatus {
+    #[serde(default)]
+    status: String,
+}
+
+/// `code` as the server must give it: two groups of four capital letters or digits 2 to 9,
+/// joined by a dash (`^[A-Z2-9]{4}-[A-Z2-9]{4}$`). Anything else is refused, so a code can
+/// only ever be those nine plain characters in an address.
+fn is_link_code(code: &str) -> bool {
+    let b = code.as_bytes();
+    b.len() == 9 && b.iter().enumerate().all(|(i, &c)| if i == 4 { c == b'-' } else { c.is_ascii_uppercase() || (b'2'..=b'9').contains(&c) })
+}
+
+/// The page where the player types the code and confirms a sign-in: `<origin>/link`. The
+/// address carries no code: the player reads it in Wikelink and types it on the site. The origin is
+/// Wikelink's own server address ([`server_address`], as [`openable_url`] lets it be opened as a
+/// [`Link::Site`]), never one from an answer. `None`, and nothing is opened, unless `code` is
+/// [`is_link_code`].
+pub fn link_page(code: &str) -> Option<String> {
+    link_page_at(server_address(), code)
+}
+
+/// [`link_page`] for the address `active` (tests give it). Pure.
+fn link_page_at(active: &str, code: &str) -> Option<String> {
+    if !is_link_code(code) {
+        return None;
+    }
+    openable_url(active, Link::Site).map(|origin| format!("{origin}/link"))
+}
+
+fn unexpected_answer() -> LinkError {
+    LinkError::Failed(tr!("unexpected answer from the server", "resposta inesperada do servidor").to_string())
+}
+
+/// A refusal (4xx/5xx) of a sign-in request.
+fn link_refusal(status: u16, body: &[u8], retry_after: Option<Duration>) -> LinkError {
+    match status {
+        404 => LinkError::Unsupported,
+        429 => LinkError::RateLimited { message: server_error(429, body), retry_after },
+        _ => LinkError::Failed(server_error(status, body)),
+    }
+}
+
+/// What an answer to `link/start` means. Pure. The code must pass [`is_link_code`] and the
+/// secret be printable ASCII of reasonable length; the times are kept within
+/// [`LINK_MAX_WAIT_SECS`] and [`LINK_MAX_INTERVAL_SECS`], and at least one second.
+fn link_start_answer(status: u16, body: &[u8], retry_after: Option<Duration>) -> Result<LinkCode, LinkError> {
+    if status != 200 {
+        return Err(if status >= 400 { link_refusal(status, body, retry_after) } else { unexpected_answer() });
+    }
+    let r: LinkStartResponse = serde_json::from_slice(body).map_err(|_| unexpected_answer())?;
+    let secret_ok = !r.secret.is_empty() && r.secret.len() <= LINK_SECRET_MAX && r.secret.bytes().all(|b| b.is_ascii_graphic());
+    if !is_link_code(&r.code) || !secret_ok {
+        return Err(unexpected_answer());
+    }
+    Ok(LinkCode {
+        code: r.code,
+        secret: r.secret,
+        expires_in: Duration::from_secs(r.expires_in.clamp(1, LINK_MAX_WAIT_SECS)),
+        interval: Duration::from_secs(r.interval.clamp(1, LINK_MAX_INTERVAL_SECS)),
+    })
+}
+
+/// What an answer to `link/poll` means. Pure. 202: still waiting; 200: the session (a token
+/// that could not go in a header is refused); 410: refused or expired (anything but `denied`
+/// reads as expired).
+fn link_poll_answer(status: u16, body: &[u8], retry_after: Option<Duration>) -> Result<LinkPoll, LinkError> {
+    match status {
+        202 => Ok(LinkPoll::Pending),
+        200 => {
+            let r: LoginResponse = serde_json::from_slice(body).map_err(|_| unexpected_answer())?;
+            if r.token.is_empty() || !r.token.bytes().all(|b| b.is_ascii_graphic()) {
+                return Err(unexpected_answer());
+            }
+            // The handle and the name are printed and saved to `watcher.json`: plain text only.
+            let name = account_name(&r.account);
+            Ok(LinkPoll::SignedIn(SignIn { token: r.token, handle: server_text(&r.account.handle), name }))
+        }
+        410 => {
+            let said = serde_json::from_slice::<LinkStatus>(body).map(|s| s.status).unwrap_or_default();
+            Ok(if said == "denied" { LinkPoll::Denied } else { LinkPoll::Expired })
+        }
+        s if s >= 400 => Err(link_refusal(s, body, retry_after)),
+        _ => Err(unexpected_answer()),
+    }
+}
+
+impl Client {
+    /// The same client with another session token (same address, same timeout).
+    fn with_token(&self, token: &str) -> Client {
+        Client { base: self.base.clone(), token: token.to_string(), http: self.http.clone() }
+    }
+
+    /// Status, body and `Retry-After` of an answer to a sign-in request; no answer at all is
+    /// [`LinkError::Failed`] with why.
+    fn link_answer(&self, res: Result<ureq::http::Response<ureq::Body>, ureq::Error>) -> Result<ApiAnswer, LinkError> {
+        let server = self.base.clone().unwrap_or_default();
+        let mut res = res.map_err(|e| LinkError::Failed(trf!("could not reach {server}: {e}", "não foi possível falar com {server}: {e}")))?;
+        let status = res.status().as_u16();
+        let retry_after = res.headers().get("retry-after").and_then(|v| v.to_str().ok()).and_then(parse_retry_after);
+        let body = read_body(&mut res, SMALL_BODY_LIMIT).map_err(LinkError::Failed)?;
+        Ok(ApiAnswer { status, body, etag: None, retry_after })
+    }
+
+    /// `POST /api/auth/link/start` with this PC's name; no session token goes with it.
+    fn link_start(&self, device: &str) -> Result<LinkCode, LinkError> {
+        let url = self.url("/api/auth/link/start").map_err(LinkError::Failed)?;
+        let res = self.http.post(&url).send_json(serde_json::json!({ "device": device }));
+        let a = self.link_answer(res)?;
+        link_start_answer(a.status, &a.body, a.retry_after)
+    }
+
+    /// `POST /api/auth/link/poll` with the secret of [`Client::link_start`]'s answer.
+    fn link_poll(&self, secret: &str) -> Result<LinkPoll, LinkError> {
+        let url = self.url("/api/auth/link/poll").map_err(LinkError::Failed)?;
+        let res = self.http.post(&url).send_json(serde_json::json!({ "secret": secret }));
+        let a = self.link_answer(res)?;
+        link_poll_answer(a.status, &a.body, a.retry_after)
+    }
+
+    /// Poll every `link.interval` until the code is confirmed, refused or expired (its
+    /// `expires_in` counted from now), a request fails, or `cancel` is set (looked at every
+    /// [`LINK_CANCEL_STEP`]). A 429 only makes the next pause longer (its `Retry-After`).
+    fn wait_for_link(&self, link: &LinkCode, cancel: &AtomicBool) -> LinkOutcome {
+        let deadline = Instant::now() + link.expires_in;
+        let mut pause = link.interval;
+        loop {
+            let until = (Instant::now() + pause).min(deadline);
+            loop {
+                if cancel.load(Ordering::Relaxed) {
+                    return LinkOutcome::Cancelled;
+                }
+                let left = until.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    break;
+                }
+                std::thread::sleep(left.min(LINK_CANCEL_STEP));
+            }
+            if Instant::now() >= deadline {
+                return LinkOutcome::Expired;
+            }
+            pause = link.interval;
+            match self.link_poll(&link.secret) {
+                Ok(LinkPoll::Pending) => {}
+                Ok(LinkPoll::SignedIn(s)) => {
+                    if cancel.load(Ordering::Relaxed) {
+                        // Cancelled while this answer was on its way: the session is not kept
+                        // here, so it is ended on the server too.
+                        let _ = self.with_token(&s.token).sign_out();
+                        return LinkOutcome::Cancelled;
+                    }
+                    return LinkOutcome::SignedIn(s);
+                }
+                Ok(LinkPoll::Denied) => return LinkOutcome::Denied,
+                Ok(LinkPoll::Expired) => return LinkOutcome::Expired,
+                Err(LinkError::RateLimited { retry_after, .. }) => pause = retry_after.unwrap_or(link.interval * 2).max(link.interval),
+                Err(e) => return LinkOutcome::Failed(e),
+            }
+        }
+    }
+
+    /// `POST /api/auth/logout` with the session token, so the server ends that session. `Ok`
+    /// for a 2xx answer, and when there is no token (nothing to end).
+    fn sign_out(&self) -> Result<(), String> {
+        let url = self.url("/api/auth/logout")?;
+        if self.token.is_empty() {
+            return Ok(());
+        }
+        let res = self.http.post(&url).header("Authorization", &self.auth()).send_empty().map_err(|e| e.to_string())?;
+        let status = res.status().as_u16();
+        if (200..300).contains(&status) { Ok(()) } else { Err(format!("HTTP {status}")) }
+    }
+}
+
+/// The client of the sign-in through the site: [`server_address`], no session token yet.
+fn link_client() -> Client {
+    Client::with_timeout("", "", LINK_TIMEOUT)
+}
+
+/// Start a sign-in through the site at [`server_address`], naming this PC as the heartbeat
+/// does ([`pc_name`]), so the site can show which PC asks.
+pub fn link_start() -> Result<LinkCode, LinkError> {
+    link_client().link_start(&pc_name())
+}
+
+/// Wait for the player's decision on the site about `link` (see [`Client::wait_for_link`]).
+/// Blocks: the window runs it on a thread of its own.
+pub fn wait_for_link(link: &LinkCode, cancel: &AtomicBool) -> LinkOutcome {
+    link_client().wait_for_link(link, cancel)
+}
+
+/// Best effort, before the session is forgotten here: ask the server to end the session `cfg`
+/// holds, giving up after [`SIGN_OUT_TIMEOUT`]. Its answer never stops the sign-out on this PC.
+pub fn sign_out_on_server(cfg: &AgentConfig) -> Result<(), String> {
+    if cfg.token.is_empty() {
+        return Ok(());
+    }
+    Client::with_timeout(&cfg.server, &cfg.token, SIGN_OUT_TIMEOUT).sign_out()
+}
+
+/// [`sign_out_on_server`] for a session `token` that [`server_address`] just gave (a sign-in
+/// the window no longer keeps), giving up after [`SIGN_OUT_TIMEOUT`]. Best effort.
+pub fn sign_out_token(token: &str) -> Result<(), String> {
+    if token.is_empty() {
+        return Ok(());
+    }
+    Client::with_timeout(server_address(), token, SIGN_OUT_TIMEOUT).sign_out()
+}
+
+/// This PC's name as the heartbeat sends it (`COMPUTERNAME`, else `HOSTNAME`, else `pc`).
+fn pc_name() -> String {
+    std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).unwrap_or_else(|_| "pc".into())
 }
 
 /// The public repository Wikelink's releases are published from (the README's Releases
@@ -1425,7 +1756,8 @@ pub enum Link {
 /// an address [`parse_web_url`] reads exactly as given that keeps the transport rule (https,
 /// or plain http to this PC). A [`Link::Site`] is a bare origin; a [`Link::Release`] is
 /// `https://github.com/` + [`RELEASES_REPO`] + `/releases`, or a page under it. The answer is
-/// rebuilt from the parts checked.
+/// rebuilt from the parts checked. The sign-in page (`/link`, a path this reading
+/// refuses) is built by [`link_page`] on top of the [`Link::Site`] origin.
 pub fn openable_url(url: &str, link: Link) -> Option<String> {
     let u = parse_web_url(url)?;
     if !u.secure_enough() {
@@ -1446,35 +1778,38 @@ pub fn session_name(cfg: &AgentConfig) -> Result<Option<String>, SendError> {
     Client::new(&cfg.server, &cfg.token).me()
 }
 
-fn interactive_login(handle: Option<String>, password: Option<String>) -> anyhow::Result<(String, String, String)> {
-    let handle = match handle {
-        Some(h) if !h.trim().is_empty() => h.trim().to_string(),
-        _ => prompt(tr!("User: ", "Usuário: "))?,
-    };
-    let password = match password {
-        Some(p) => p,
-        None => rpassword::prompt_password(tr!("Password: ", "Senha: "))?,
-    };
-    let (token, name) = login(&handle, &password)?;
-    Ok((token, handle, name))
+/// The terminal's sign-in through the site: print the page and the code, open the browser
+/// there, and wait (see [`wait_for_link`]) until the player confirms or refuses it on the site,
+/// the code expires, or `stop` is set (Ctrl+C in a running `watch`; before that, Ctrl+C simply
+/// ends the program).
+fn terminal_sign_in(stop: &AtomicBool) -> anyhow::Result<SignIn> {
+    let link = link_start().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let page = link_page(&link.code).with_context(|| tr!("unexpected answer from the server", "resposta inesperada do servidor"))?;
+    let code = &link.code;
+    eprintln!();
+    eprintln!("{}", trf!("Sign in on the site: {page}", "Entre pelo site: {page}"));
+    eprintln!("{}", trf!("Code: {code} (type it on the site)", "Código: {code} (digite-o no site)"));
+    if let Err(e) = open::that_detached(&page) {
+        eprintln!("{}", trf!("could not open the browser ({e}); open the address above", "não deu para abrir o navegador ({e}); abra o endereço acima"));
+    }
+    eprintln!("{}", tr!("Waiting for the confirmation in the browser… (Ctrl+C to cancel)", "Aguardando a confirmação no navegador… (Ctrl+C para cancelar)"));
+    match wait_for_link(&link, stop) {
+        LinkOutcome::SignedIn(s) => Ok(s),
+        other => bail!("{other}"),
+    }
 }
 
 // ----- setup (interactive) ------------------------------------------------------------
 
-/// Where `start` and `watch` read the password from when `--password` is not given (the
-/// `env` of those options in main.rs carries the same name).
-const PASSWORD_ENV: &str = "WIKELINK_PASSWORD";
-
 pub struct SetupOptions {
     pub channel: Option<String>,
-    pub handle: Option<String>,
-    pub password: Option<String>,
     /// `Some(x)` sets the automatic data upload without asking.
     pub share_data: Option<bool>,
 }
 
-/// Make sure there is a valid session and an install to follow; asks interactively for
-/// whatever is missing. Returns the saved config and the account name.
+/// Make sure there is a valid session and an install to follow; when `interactive`, a missing
+/// session is made through the site (see [`terminal_sign_in`]) and the upload switch is asked.
+/// Returns the saved config and the account name.
 pub fn ensure_setup(opts: SetupOptions, interactive: bool) -> anyhow::Result<(AgentConfig, String)> {
     // A token saved for another address is gone already (see `with_token_rule`).
     let loaded = load_config().unwrap_or_default();
@@ -1490,15 +1825,16 @@ pub fn ensure_setup(opts: SetupOptions, interactive: bool) -> anyhow::Result<(Ag
     let name = match client.me() {
         Ok(Some(n)) => n,
         Ok(None) | Err(SendError::Unauthorized) => {
-            if !interactive && opts.password.is_none() {
+            if !interactive {
                 bail!(tr!("server session no longer valid; open Wikelink to sign in again", "sessão no servidor inválida; abra o Wikelink para entrar de novo"));
             }
-            let (token, handle, name) = interactive_login(opts.handle.clone().or_else(|| Some(cfg.handle.clone())), opts.password.clone())?;
+            // No Ctrl+C handler is set yet: Ctrl+C ends the program, so this switch stays off.
+            let s = terminal_sign_in(&AtomicBool::new(false))?;
             cfg.server = server_address().to_string();
-            cfg.token = token;
-            cfg.handle = handle;
-            cfg.name = Some(name.clone());
-            name
+            cfg.token = s.token;
+            cfg.handle = s.handle;
+            cfg.name = Some(s.name.clone());
+            s.name
         }
         Err(e) => {
             let server = server_address();
@@ -1611,10 +1947,11 @@ fn data_check(client: &Client, name: &str, handle: &str) -> String {
             Ok(built) => match client.upload_bundle(&built.bytes) {
                 Ok(r) => {
                     let outcome = match r.status.as_str() {
-                        "activated" => tr!("already in use", "já em uso"),
-                        "pending" => tr!("received, not in use yet", "recebido, ainda não em uso"),
-                        "invalid" => tr!("not accepted", "não aceito"),
-                        other => other,
+                        "activated" => tr!("already in use", "já em uso").to_string(),
+                        "pending" => tr!("received, not in use yet", "recebido, ainda não em uso").to_string(),
+                        "stored" => tr!("received; the build in use is newer", "recebido; o build em uso é mais novo").to_string(),
+                        "invalid" => tr!("not accepted", "não aceito").to_string(),
+                        other => server_text(other),
                     };
                     let (label, contracts, mb, hash) = (&built.label, built.contracts, built.bytes.len() as f64 / 1048576.0, &built.content_hash);
                     say!(
@@ -1647,6 +1984,260 @@ fn data_check(client: &Client, name: &str, handle: &str) -> String {
     } else {
         let all = lines.join(" · ");
         format!("{at}: {all}")
+    }
+}
+
+// ----- blueprints in old logs ---------------------------------------------------------
+
+/// How often the channel's `logbackups\` is looked at for old logs not read yet (the first
+/// pass runs when the watcher starts).
+const BACKLOG_EVERY: Duration = Duration::from_secs(3600);
+/// Most old logs read in one pass, the newest first; the others wait for the next pass.
+const BACKLOG_FILES_PER_PASS: usize = 200;
+/// Most events in one request of a pass.
+const BACKLOG_BATCH: usize = 200;
+
+/// `<data dir>/logbackups-read.json`: the old logs already read (see [`BacklogState`]).
+fn backlog_state_path() -> PathBuf {
+    data_dir().join("logbackups-read.json")
+}
+
+/// The old logs already read: their blueprints were accepted, or got a final refusal (see
+/// [`backlog_pass`]). Per channel, file name → its size when read. A file whose size changed is read again. It belongs to one account:
+/// signed in as another one, every file is read again for that one.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct BacklogState {
+    #[serde(default)]
+    account: String,
+    #[serde(default)]
+    channels: BTreeMap<String, BTreeMap<String, u64>>,
+}
+
+impl BacklogState {
+    /// The list saved at `p` for `account`; empty when it is missing, unreadable or another
+    /// account's.
+    fn load(p: &Path, account: &str) -> Self {
+        std::fs::read_to_string(p)
+            .ok()
+            .and_then(|s| serde_json::from_str::<BacklogState>(&s).ok())
+            .filter(|s| s.account == account)
+            .unwrap_or_else(|| BacklogState { account: account.to_string(), ..Default::default() })
+    }
+
+    /// Written like `watcher.json`: a temporary file in the same folder renamed over the old
+    /// one, so a quit halfway never leaves half a file. Only the watcher writes this one.
+    fn save(&self, p: &Path) -> anyhow::Result<()> {
+        write_config_text(p, &serde_json::to_string_pretty(self)?)
+    }
+
+    fn is_read(&self, channel: &str, name: &str, size: u64) -> bool {
+        self.channels.get(channel).and_then(|files| files.get(name)) == Some(&size)
+    }
+
+    fn mark_read(&mut self, channel: &str, name: &str, size: u64) {
+        self.channels.entry(channel.to_string()).or_default().insert(name.to_string(), size);
+    }
+
+    /// Forget the files of `channel` no longer in its folder, so the list stays small.
+    /// Whether anything was forgotten.
+    fn keep_only(&mut self, channel: &str, present: &BTreeSet<String>) -> bool {
+        let Some(files) = self.channels.get_mut(channel) else { return false };
+        let before = files.len();
+        files.retain(|name, _| present.contains(name));
+        files.len() != before
+    }
+}
+
+/// What one pass over the old logs did.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct BacklogPass {
+    /// Files read whose events the server accepted (files without blueprints included).
+    read: usize,
+    /// Blueprints sent.
+    blueprints: usize,
+    /// Files with a batch that got [`BacklogSendError::Refused`]: counted as read, never
+    /// sent again.
+    refused: usize,
+    /// Files that could not be read, or whose events were not accepted; tried again next pass.
+    failed: usize,
+    /// Files not read yet left for the next pass by [`BACKLOG_FILES_PER_PASS`].
+    left: usize,
+}
+
+/// Why a batch of events read from an old log did not go out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BacklogSendError {
+    /// An answer this client treats as a final refusal of the request (see
+    /// [`is_final_refusal`]): the file counts as read and the pass goes on.
+    Refused(String),
+    /// No answer, a timeout, or an answer this client tries again later (401, 408, 409, 429, 5xx,
+    /// the watcher paused from the site): the pass ends and the file stays unread.
+    Later(String),
+}
+
+/// Whether this client treats an HTTP status as a final refusal of the request: a 4xx other
+/// than 401 (the session), 408 (a timeout), 409 (no data for the channel yet) and 429 (too many
+/// requests). `None` (no answer)
+/// is not one.
+fn is_final_refusal(status: Option<u16>) -> bool {
+    matches!(status, Some(s) if (400..500).contains(&s) && !matches!(s, 401 | 408 | 409 | 429))
+}
+
+/// Sends one batch of events read from an old log.
+type BacklogSend<'a> = dyn FnMut(&[(bool, TrackerOutput)]) -> Result<(), BacklogSendError> + 'a;
+
+/// One pass over `dir` (a channel's `logbackups\`): every `*.log` not in the list at
+/// `state_path` with its current size, the newest first and at most
+/// [`BACKLOG_FILES_PER_PASS`] of them, is read for its blueprints, which go to `send` in
+/// batches of [`BACKLOG_BATCH`] (an event repeated in the same file, same timestamp and same
+/// name, goes once). A file joins the list once `send` accepted all its events, or once
+/// `send` gave [`BacklogSendError::Refused`] for one of its batches (that file is set aside
+/// and the pass goes on with the next one). [`BacklogSendError::Later`] ends the pass (the
+/// server is out of reach; the rest waits for the next one); a file that cannot be read is
+/// only skipped. Each failure is one log line.
+///
+/// Nothing in `dir` is written: the list lives at `state_path`, in the data folder.
+fn backlog_pass(
+    state_path: &Path,
+    account: &str,
+    channel: &str,
+    dir: &Path,
+    parser: &wikelo_log::LineParser,
+    stop: &AtomicBool,
+    send: &mut BacklogSend<'_>,
+) -> BacklogPass {
+    let mut state = BacklogState::load(state_path, account);
+    let mut files = wikelo_log::list_logbackups(dir);
+    // `list_logbackups` gives them oldest first.
+    files.reverse();
+    let present: BTreeSet<String> = files.iter().filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(str::to_string)).collect();
+    // An empty listing may be a folder that cannot be read right now: forget nothing then.
+    let mut dirty = !present.is_empty() && state.keep_only(channel, &present);
+    let mut pass = BacklogPass::default();
+    let mut tried = 0usize;
+    let save = |state: &BacklogState| {
+        if let Err(e) = state.save(state_path) {
+            say!("{}", trf!("could not save the list of old logs read ({e:#})", "não deu para salvar a lista de logs antigos lidos ({e:#})"));
+        }
+    };
+    for path in &files {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        let size = match std::fs::metadata(path) {
+            Ok(m) => m.len(),
+            Err(e) => {
+                say!("{}", trf!("could not read the old log {name} ({e}); trying again in 1 h", "não deu para ler o log antigo {name} ({e}); tento de novo em 1 h"));
+                pass.failed += 1;
+                continue;
+            }
+        };
+        if state.is_read(channel, name, size) {
+            continue;
+        }
+        if tried >= BACKLOG_FILES_PER_PASS {
+            pass.left += 1;
+            continue;
+        }
+        tried += 1;
+        let scan = match wikelo_log::blueprints_in(path, parser) {
+            Ok(s) => s,
+            Err(e) => {
+                say!("{}", trf!("could not read the old log {name} ({e}); trying again in 1 h", "não deu para ler o log antigo {name} ({e}); tento de novo em 1 h"));
+                pass.failed += 1;
+                continue;
+            }
+        };
+        if scan.truncated {
+            let mib = wikelo_log::BACKLOG_MAX_BYTES / (1024 * 1024);
+            say!("{}", trf!("old log {name} is over {mib} MiB: only its start was read", "o log antigo {name} passa de {mib} MiB: só o começo foi lido"));
+        }
+        if scan.capped {
+            let most = wikelo_log::BACKLOG_MAX_BLUEPRINTS;
+            say!("{}", trf!("old log {name} has over {most} blueprints: only the first {most} were read", "o log antigo {name} tem mais de {most} blueprints: só os {most} primeiros foram lidos"));
+        }
+        // The same event twice in one file (same timestamp, same name) goes once.
+        let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+        // Old sessions are history: sent as replayed events, like the start of `Game.log`.
+        let events: Vec<(bool, TrackerOutput)> = scan
+            .blueprints
+            .into_iter()
+            .filter(|b| seen.insert((b.at.clone(), b.name.clone())))
+            .map(|b| (true, TrackerOutput::BlueprintReceived { at: b.at, name: b.name, mission_id: None }))
+            .collect();
+        let mut sent = Ok(());
+        let mut accepted = 0usize;
+        for chunk in events.chunks(BACKLOG_BATCH) {
+            sent = send(chunk);
+            if sent.is_err() {
+                break;
+            }
+            accepted += chunk.len();
+        }
+        match sent {
+            Ok(()) => {
+                pass.read += 1;
+                pass.blueprints += events.len();
+            }
+            Err(BacklogSendError::Refused(e)) => {
+                // A final refusal: the file is set aside as read, so it never holds up the
+                // older files nor is sent again every hour.
+                say!("{}", trf!("the server refused the blueprints of the old log {name} ({e}); it is not sent again", "o servidor recusou os blueprints do log antigo {name} ({e}); ele não é enviado de novo"));
+                pass.refused += 1;
+                pass.blueprints += accepted;
+            }
+            Err(BacklogSendError::Later(e)) => {
+                say!("{}", trf!("could not send the blueprints of the old logs ({e}); trying again in 1 h", "não deu para enviar os blueprints dos logs antigos ({e}); tento de novo em 1 h"));
+                pass.failed += 1;
+                break;
+            }
+        }
+        state.mark_read(channel, name, size);
+        dirty = true;
+        // Saved right after every file whose events went out, so a quit never sends them twice.
+        if !events.is_empty() {
+            save(&state);
+            dirty = false;
+        }
+    }
+    if dirty {
+        save(&state);
+    }
+    pass
+}
+
+/// What one answer to a batch of old-log events means for [`backlog_pass`]: accepted only
+/// when the server takes events (not while the watcher is paused on the site); a final
+/// refusal of the request ([`is_final_refusal`]) is [`BacklogSendError::Refused`]; anything
+/// else is [`BacklogSendError::Later`]. Pure.
+fn backlog_verdict(answer: Result<Ack, (Option<u16>, SendError)>) -> Result<(), BacklogSendError> {
+    match answer {
+        Ok(ack) if ack.enabled => Ok(()),
+        Ok(_) => Err(BacklogSendError::Later(tr!("paused from the site", "pausado pelo site").to_string())),
+        Err((status, e)) if is_final_refusal(status) => {
+            let code = status.unwrap_or_default();
+            Err(BacklogSendError::Refused(format!("HTTP {code}: {e:?}")))
+        }
+        Err((_, e)) => Err(BacklogSendError::Later(format!("{e:?}"))),
+    }
+}
+
+/// [`backlog_pass`] over the followed channel's `logbackups\`, sending through `client` with
+/// the same request as the live events (see [`backlog_verdict`] for what an answer means).
+fn backlog_check(client: &Client, channel: &str, host: &str, share: bool, account: &str, dir: &Path, stop: &AtomicBool) {
+    let parser = wikelo_log::LineParser::new();
+    let mut send = |chunk: &[(bool, TrackerOutput)]| backlog_verdict(client.send_with_status(channel, host, share, chunk));
+    let pass = backlog_pass(&backlog_state_path(), account, channel, dir, &parser, stop, &mut send);
+    let BacklogPass { read, blueprints, refused, failed, left } = pass;
+    if read > 0 || refused > 0 || left > 0 || failed > 0 {
+        say!(
+            "{}",
+            trf!(
+                "old logs: {read} read, {blueprints} blueprints sent, {refused} refused, {failed} failed, {left} for later",
+                "logs antigos: {read} lidos, {blueprints} blueprints enviados, {refused} recusados, {failed} com falha, {left} para depois"
+            )
+        );
     }
 }
 
@@ -1735,7 +2326,7 @@ pub fn run(opts: WatchOptions) -> anyhow::Result<()> {
         let s = stop.clone();
         let _ = ctrlc::set_handler(move || s.store(true, Ordering::Relaxed));
     }
-    let host = std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).unwrap_or_else(|_| "pc".into());
+    let host = pc_name();
     let channel = install.channel.clone();
     let mut share = cfg.share_data == Some(true);
     let author_name = cfg.display_name();
@@ -1766,6 +2357,8 @@ pub fn run(opts: WatchOptions) -> anyhow::Result<()> {
     let mut paused = false;
     let mut last_data_check: Option<Instant> = None;
     let mut last_update_check: Option<Instant> = None;
+    let mut last_backlog: Option<Instant> = None;
+    let backlog_busy = Arc::new(AtomicBool::new(false));
     let mut last_rotate = Instant::now();
     let checking: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
     let check_result: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -1861,6 +2454,20 @@ pub fn run(opts: WatchOptions) -> anyhow::Result<()> {
             dirty = true;
         }
 
+        // Blueprints in the old logs of `logbackups\`: right after start, then hourly. In a
+        // thread of its own, so reading many files never holds up the live tailing.
+        if last_backlog.is_none_or(|t| t.elapsed() > BACKLOG_EVERY) && !backlog_busy.swap(true, Ordering::Relaxed) {
+            last_backlog = Some(Instant::now());
+            let c = client.clone();
+            let (ch, h, account, dir) = (channel.clone(), host.clone(), cfg.handle.clone(), install.logbackups_dir.clone());
+            let (busy, halt) = (backlog_busy.clone(), stop_loop.clone());
+            std::thread::spawn(move || {
+                // A panic in there must not leave the pass marked as running forever.
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| backlog_check(&c, &ch, &h, share, &account, &dir, &halt)));
+                busy.store(false, Ordering::Relaxed);
+            });
+        }
+
         // Once a day (and right after start): is there a newer release? The server knows.
         if last_update_check.is_none_or(|t| t.elapsed() > UPDATE_CHECK_EVERY) {
             last_update_check = Some(Instant::now());
@@ -1923,13 +2530,14 @@ pub fn run(opts: WatchOptions) -> anyhow::Result<()> {
                     status.last_error = Some(tr!("session expired: sign in again", "sessão expirada: entre de novo").into());
                     stop_loop.store(true, Ordering::Relaxed);
                 } else {
-                    say!("{}", tr!("the server session expired; sign in again.", "a sessão no servidor expirou; entre de novo."));
-                    match interactive_login(Some(cfg.handle.clone()), None) {
-                        Ok((token, handle, name)) => {
+                    say!("{}", tr!("the server session expired; sign in again on the site.", "a sessão no servidor expirou; entre de novo pelo site."));
+                    // Ctrl+C sets `stop_loop` here (its handler is set): it cancels the wait too.
+                    match terminal_sign_in(&stop_loop) {
+                        Ok(s) => {
                             cfg.server = server.to_string();
-                            cfg.token = token;
-                            cfg.handle = handle;
-                            cfg.name = Some(name);
+                            cfg.token = s.token;
+                            cfg.handle = s.handle;
+                            cfg.name = Some(s.name);
                             let _ = update_config(&cfg, |d| copy_sign_in(d, &cfg));
                             cfg_mtime = config_mtime();
                             client = Client::new(&cfg.server, &cfg.token);
@@ -2044,9 +2652,6 @@ pub fn start_background() -> anyhow::Result<u32> {
     let err = out.try_clone()?;
     let mut cmd = std::process::Command::new(exe);
     cmd.args(["watch", "--daemon"]).stdin(std::process::Stdio::null()).stdout(out).stderr(err);
-    // The password given to `start` is used up by now (the session token is saved): the
-    // background watcher does not inherit it.
-    cmd.env_remove(PASSWORD_ENV);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -2191,7 +2796,7 @@ where
 }
 
 /// [`spawn_self_detached`] for the executable at `exe` (the updater starts the file it just put
-/// in place by its path). The password of [`PASSWORD_ENV`] is never passed on.
+/// in place by its path).
 pub(crate) fn spawn_detached<I, S>(exe: &Path, args: I, env: Option<(&str, &str)>) -> anyhow::Result<()>
 where
     I: IntoIterator<Item = S>,
@@ -2199,7 +2804,6 @@ where
 {
     let mut cmd = std::process::Command::new(exe);
     cmd.args(args).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
-    cmd.env_remove(PASSWORD_ENV);
     if let Some((k, v)) = env {
         cmd.env(k, v);
     }
@@ -3148,5 +3752,649 @@ mod tests {
         assert!(rotate_log_if_big(&log, 2048).unwrap());
         assert_eq!(std::fs::metadata(&old).unwrap().len(), 3000);
         assert!(rotate_log_if_big(dir.path().join("missing.log").as_path(), 10).map(|r| !r).unwrap_or(true), "no file: nothing to rotate");
+    }
+
+    // ----- sign-in through the site ---------------------------------------------------
+
+    /// One request the fake server below received.
+    #[derive(Debug)]
+    struct Seen {
+        /// E.g. `POST /api/auth/link/poll HTTP/1.1`.
+        line: String,
+        authorization: Option<String>,
+        body: String,
+    }
+
+    /// A fake server on this PC in place of the real one: it answers each connection, in
+    /// order, with the next of `answers` (status, extra header lines each ending in `\r\n`,
+    /// body) and closes it. Joining the handle gives what each request was.
+    fn fake_server(answers: Vec<(u16, &'static str, &'static str)>) -> (String, std::thread::JoinHandle<Vec<Seen>>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let handle = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for (status, headers, body) in answers {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let (mut length, mut chunked, mut authorization) = (0usize, false, None);
+                loop {
+                    let mut h = String::new();
+                    reader.read_line(&mut h).unwrap();
+                    let h = h.trim_end();
+                    if h.is_empty() {
+                        break;
+                    }
+                    if let Some((k, v)) = h.split_once(':') {
+                        let v = v.trim();
+                        if k.eq_ignore_ascii_case("content-length") {
+                            length = v.parse().unwrap();
+                        } else if k.eq_ignore_ascii_case("transfer-encoding") {
+                            chunked = v.eq_ignore_ascii_case("chunked");
+                        } else if k.eq_ignore_ascii_case("authorization") {
+                            authorization = Some(v.to_string());
+                        }
+                    }
+                }
+                let mut got = Vec::new();
+                if chunked {
+                    loop {
+                        let mut size = String::new();
+                        reader.read_line(&mut size).unwrap();
+                        let n = usize::from_str_radix(size.trim().split(';').next().unwrap_or("0"), 16).unwrap();
+                        let mut chunk = vec![0u8; n + 2];
+                        reader.read_exact(&mut chunk).unwrap();
+                        got.extend_from_slice(&chunk[..n]);
+                        if n == 0 {
+                            break;
+                        }
+                    }
+                } else {
+                    got.resize(length, 0);
+                    reader.read_exact(&mut got).unwrap();
+                }
+                seen.push(Seen { line: line.trim_end().to_string(), authorization, body: String::from_utf8_lossy(&got).into_owned() });
+                let answer = format!("HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{headers}\r\n{body}", body.len());
+                stream.write_all(answer.as_bytes()).unwrap();
+            }
+            seen
+        });
+        (base, handle)
+    }
+
+    /// An address on this PC where nothing listens.
+    fn closed_port_base() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        format!("http://127.0.0.1:{port}")
+    }
+
+    const START_OK: &str = r#"{"code":"ABCD-EFGH","secret":"c2VjcmV0LXNlY3JldC1zZWNyZXQtc2VjcmV0LXNlY3I","expiresIn":600,"interval":3}"#;
+    const SIGNED_IN: &str = r#"{"token":"tok-123","expiresAt":"2027-11-22T00:00:00Z","account":{"id":7,"handle":"TestPilot","displayName":"Test Pilot"}}"#;
+
+    #[test]
+    fn link_codes_are_two_groups_of_four() {
+        // The pattern is `^[A-Z2-9]{4}-[A-Z2-9]{4}$` (the letters the site avoids still pass it).
+        for good in ["ABCD-EFGH", "2345-6789", "ZZ99-A2B3", "IOLA-LOIL"] {
+            assert!(is_link_code(good), "{good:?}");
+        }
+        for bad in [
+            "",
+            "ABCD-EFG",
+            "ABCDE-FGH",
+            "ABCDEFGHJ",
+            "ABCD_EFGH",
+            "ABCD EFGH",
+            "abcd-efgh",
+            "ABCd-EFGH",
+            "ABC0-EFGH",
+            "ABC1-EFGH",
+            " ABCD-EFGH",
+            "ABCD-EFGH ",
+            "ABCD-EFGH\n",
+            "ABCD-EFGH-JKMN",
+            "ABÇ-EFGH",
+            "AB/D-EFGH",
+            "AB.D-EFGH",
+            "ABCD-EF@H",
+            "ABCD-EF%H",
+            "ABCD--EFG",
+        ] {
+            assert!(!is_link_code(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_link_page_is_built_from_this_clients_own_address() {
+        assert_eq!(link_page_at(SITE, "ABCD-EFGH").as_deref(), Some("https://wikelist.net/link"));
+        assert_eq!(link_page_at("http://localhost:8787", "XY23-Z9AB").as_deref(), Some("http://localhost:8787/link"));
+        // Whatever a code from an answer holds, it cannot move the page elsewhere: anything but
+        // the nine plain characters opens nothing.
+        for bad in [
+            "ABCD-EFGH@evil.example",
+            "@evil.example",
+            "//evil.example",
+            ".evil.example",
+            "ABCD-EFGH/../../x",
+            "ABCD-EFGH#x",
+            "ABCD-EFGH&next=https://evil.example",
+            "ABCD-EFGH?x",
+            "ABCD%2FEFGH",
+            "abcd-efgh",
+            " ABCD-EFGH",
+            "ABCD-EFGH\r\nX: y",
+            "",
+        ] {
+            assert_eq!(link_page_at(SITE, bad), None, "{bad:?}");
+        }
+        // Only an address Wikelink may open is a base.
+        for origin in ["http://wikelist.net", "https://wikelist.net/somewhere", "https://user@wikelist.net", "javascript:alert(1)", "file:///C:/x", ""] {
+            assert_eq!(link_page_at(origin, "ABCD-EFGH"), None, "{origin:?}");
+        }
+        // The page is always on the site, at `/link`, and the code is not in the address.
+        let page = link_page_at(SITE, "ZZZZ-2222").unwrap();
+        assert!(!page.contains('?') && !page.contains("ZZZZ"), "{page}");
+        let u = parse_web_url(&page).unwrap();
+        assert_eq!((u.scheme, u.host.as_str(), u.port, u.path.as_str()), ("https", "wikelist.net", None, "/link"));
+    }
+
+    #[test]
+    fn every_answer_to_link_start_has_a_meaning() {
+        let s = Duration::from_secs;
+        let start = |status: u16, body: &str| link_start_answer(status, body.as_bytes(), None);
+        assert_eq!(
+            start(200, START_OK),
+            Ok(LinkCode { code: "ABCD-EFGH".into(), secret: "c2VjcmV0LXNlY3JldC1zZWNyZXQtc2VjcmV0LXNlY3I".into(), expires_in: s(600), interval: s(3) })
+        );
+        // Times out of reason are kept within bounds.
+        let t = start(200, r#"{"code":"ABCD-EFGH","secret":"x","expiresIn":0,"interval":0}"#).unwrap();
+        assert_eq!((t.expires_in, t.interval), (s(1), s(1)));
+        let t = start(200, r#"{"code":"ABCD-EFGH","secret":"x","expiresIn":99999999,"interval":99999}"#).unwrap();
+        assert_eq!((t.expires_in, t.interval), (s(LINK_MAX_WAIT_SECS), s(LINK_MAX_INTERVAL_SECS)));
+        // A code or a secret that is not as it must be: refused, nothing is opened.
+        let long_secret = format!(r#"{{"code":"ABCD-EFGH","secret":"{}","expiresIn":600,"interval":3}}"#, "x".repeat(LINK_SECRET_MAX + 1));
+        for bad in [
+            r#"{"code":"abcd-efgh","secret":"x","expiresIn":600,"interval":3}"#,
+            r#"{"code":"ABCD-EFGH.evil.example","secret":"x","expiresIn":600,"interval":3}"#,
+            r#"{"code":"../../x","secret":"x","expiresIn":600,"interval":3}"#,
+            r#"{"secret":"x","expiresIn":600,"interval":3}"#,
+            r#"{"code":"ABCD-EFGH","secret":"","expiresIn":600,"interval":3}"#,
+            r#"{"code":"ABCD-EFGH","secret":"a b","expiresIn":600,"interval":3}"#,
+            r#"{"code":"ABCD-EFGH","secret":"x","interval":3}"#,
+            r#"{"code":"ABCD-EFGH","secret":"x","expiresIn":-1,"interval":3}"#,
+            "<html>",
+            "",
+            long_secret.as_str(),
+        ] {
+            assert_eq!(start(200, bad), Err(unexpected_answer()), "{bad:?}");
+        }
+        // Refusals.
+        assert_eq!(start(404, r#"{"error":"não encontrado"}"#), Err(LinkError::Unsupported));
+        assert!(LinkError::Unsupported.to_string().contains("não tem suporte ao Wikelink"), "the existing message");
+        assert_eq!(
+            link_start_answer(429, br#"{"error":"muitas tentativas; tente de novo em 10 min"}"#, Some(s(600))),
+            Err(LinkError::RateLimited { message: "muitas tentativas; tente de novo em 10 min".into(), retry_after: Some(s(600)) })
+        );
+        assert_eq!(start(429, ""), Err(LinkError::RateLimited { message: "HTTP 429".into(), retry_after: None }));
+        assert_eq!(start(403, r#"{"error":"recusado"}"#), Err(LinkError::Failed("recusado".into())));
+        assert_eq!(start(500, "<html>"), Err(LinkError::Failed("HTTP 500".into())));
+        // Anything else that is not a 200 is not a code.
+        for status in [201, 202, 204, 302] {
+            assert_eq!(start(status, START_OK), Err(unexpected_answer()), "{status}");
+        }
+    }
+
+    #[test]
+    fn every_answer_to_link_poll_has_a_meaning() {
+        let poll = |status: u16, body: &str| link_poll_answer(status, body.as_bytes(), None);
+        assert_eq!(poll(202, r#"{"status":"pending"}"#), Ok(LinkPoll::Pending));
+        assert_eq!(poll(202, ""), Ok(LinkPoll::Pending));
+        // Confirmed: the same data the sign-in always gave.
+        let signed = |handle: &str, name: &str| Ok(LinkPoll::SignedIn(SignIn { token: "tok-123".into(), handle: handle.into(), name: name.into() }));
+        assert_eq!(poll(200, SIGNED_IN), signed("TestPilot", "Test Pilot"));
+        assert_eq!(poll(200, r#"{"token":"tok-123","account":{"handle":"TestPilot","displayName":""}}"#), signed("TestPilot", "TestPilot"), "no display name: the handle");
+        assert_eq!(poll(200, r#"{"token":"tok-123","account":{"handle":"TestPilot"}}"#), signed("TestPilot", "TestPilot"));
+        for bad in [
+            r#"{"token":"","account":{"handle":"TestPilot"}}"#,
+            r#"{"token":"a b","account":{"handle":"TestPilot"}}"#,
+            r#"{"token":"tok\r\nX-Other: 1","account":{"handle":"TestPilot"}}"#,
+            r#"{"token":"tok-123"}"#,
+            r#"{"account":{"handle":"TestPilot"}}"#,
+            "<html>",
+            "",
+        ] {
+            assert_eq!(poll(200, bad), Err(unexpected_answer()), "{bad:?}");
+        }
+        // Decided or gone.
+        assert_eq!(poll(410, r#"{"status":"denied"}"#), Ok(LinkPoll::Denied));
+        assert_eq!(poll(410, r#"{"status":"expired"}"#), Ok(LinkPoll::Expired));
+        for other in [r#"{"status":"other"}"#, "{}", "", "<html>"] {
+            assert_eq!(poll(410, other), Ok(LinkPoll::Expired), "{other:?}");
+        }
+        // Refusals.
+        assert_eq!(poll(404, ""), Err(LinkError::Unsupported));
+        assert_eq!(
+            link_poll_answer(429, br#"{"error":"muitas tentativas; tente de novo em 1 min"}"#, Some(Duration::from_secs(60))),
+            Err(LinkError::RateLimited { message: "muitas tentativas; tente de novo em 1 min".into(), retry_after: Some(Duration::from_secs(60)) })
+        );
+        assert_eq!(poll(401, r#"{"error":"faça login"}"#), Err(LinkError::Failed("faça login".into())));
+        assert_eq!(poll(502, "bad gateway"), Err(LinkError::Failed("HTTP 502".into())));
+        for status in [201, 204, 302] {
+            assert_eq!(poll(status, SIGNED_IN), Err(unexpected_answer()), "{status}");
+        }
+    }
+
+    #[test]
+    fn server_text_is_plain_and_bounded() {
+        assert_eq!(server_text("Test Pilot"), "Test Pilot");
+        assert_eq!(server_text("bad\u{1b}[2J\r\nname\u{7}\u{9b}"), "bad[2Jname");
+        assert_eq!(server_text(&"é".repeat(500)).chars().count(), SERVER_TEXT_MAX);
+        // Error sentences, wherever they are printed or shown.
+        let long = format!(r#"{{"error":"{}"}}"#, "x".repeat(1000));
+        assert_eq!(server_error(400, long.as_bytes()).chars().count(), SERVER_TEXT_MAX);
+        assert_eq!(server_error(403, br#"{"error":"no\u001b[31m\nway"}"#), "no[31mway");
+        assert_eq!(server_error(403, br#"{"error":"\u0007\r\n"}"#), "HTTP 403", "nothing left: the status");
+    }
+
+    #[test]
+    fn handle_and_name_from_a_sign_in_are_plain_and_bounded() {
+        let body = format!(r#"{{"token":"tok-123","account":{{"handle":"Test\u001bPilot","displayName":"{}\r\n"}}}}"#, "N".repeat(300));
+        match link_poll_answer(200, body.as_bytes(), None) {
+            Ok(LinkPoll::SignedIn(s)) => {
+                assert_eq!(s.handle, "TestPilot");
+                assert_eq!(s.name, "N".repeat(SERVER_TEXT_MAX));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        // A display name of control characters only: the handle.
+        let only = r#"{"token":"tok-123","account":{"handle":"TestPilot","displayName":"\u0007\u0008"}}"#;
+        assert!(matches!(link_poll_answer(200, only.as_bytes(), None), Ok(LinkPoll::SignedIn(s)) if s.name == "TestPilot"));
+    }
+
+    #[test]
+    fn a_sign_in_through_the_site_against_a_fake_server() {
+        let (base, server) = fake_server(vec![(200, "", START_OK), (202, "", r#"{"status":"pending"}"#), (200, "", SIGNED_IN)]);
+        let client = Client::at(&base, "", "", http_agent(Duration::from_secs(5)));
+        let link = client.link_start("TEST-PC").unwrap();
+        assert_eq!(link.code, "ABCD-EFGH");
+        // Faster than the 3 s the answer asks for, for the test.
+        let link = LinkCode { interval: Duration::from_millis(20), ..link };
+        let outcome = client.wait_for_link(&link, &AtomicBool::new(false));
+        assert_eq!(outcome, LinkOutcome::SignedIn(SignIn { token: "tok-123".into(), handle: "TestPilot".into(), name: "Test Pilot".into() }));
+        let seen = server.join().unwrap();
+        assert_eq!(seen.len(), 3, "{seen:?}");
+        assert_eq!(seen[0].line, "POST /api/auth/link/start HTTP/1.1");
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&seen[0].body).unwrap(), serde_json::json!({ "device": "TEST-PC" }));
+        for s in &seen[1..] {
+            assert_eq!(s.line, "POST /api/auth/link/poll HTTP/1.1");
+            assert_eq!(serde_json::from_str::<serde_json::Value>(&s.body).unwrap(), serde_json::json!({ "secret": link.secret }));
+        }
+        assert!(seen.iter().all(|s| s.authorization.is_none()), "no session token goes with a sign-in: {seen:?}");
+
+        // A server without the sign-in through the site, and one that asks to wait.
+        let (base, server) = fake_server(vec![(404, "", ""), (429, "Retry-After: 600\r\n", r#"{"error":"muitas tentativas; tente de novo em 10 min"}"#)]);
+        let client = Client::at(&base, "", "", http_agent(Duration::from_secs(5)));
+        assert_eq!(client.link_start("TEST-PC"), Err(LinkError::Unsupported));
+        assert_eq!(client.link_start("TEST-PC"), Err(LinkError::RateLimited { message: "muitas tentativas; tente de novo em 10 min".into(), retry_after: Some(Duration::from_secs(600)) }));
+        server.join().unwrap();
+        // No server at all: the network error, with the address.
+        let closed = closed_port_base();
+        match Client::at(&closed, "", "", http_agent(Duration::from_secs(5))).link_start("TEST-PC") {
+            Err(LinkError::Failed(m)) => assert!(m.contains(&closed), "{m}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn waiting_ends_on_a_refusal_an_expiry_a_cancel_or_a_failure() {
+        let fast = || LinkCode { code: "ABCD-EFGH".into(), secret: "s3cr3t".into(), expires_in: Duration::from_secs(60), interval: Duration::from_millis(20) };
+        let at = |base: &str| Client::at(base, "", "", http_agent(Duration::from_secs(5)));
+        let off = AtomicBool::new(false);
+        // Refused in the browser.
+        let (base, server) = fake_server(vec![(202, "", ""), (410, "", r#"{"status":"denied"}"#)]);
+        assert_eq!(at(&base).wait_for_link(&fast(), &off), LinkOutcome::Denied);
+        assert_eq!(server.join().unwrap().len(), 2);
+        // Expired, or unknown, on the server.
+        let (base, server) = fake_server(vec![(410, "", r#"{"status":"expired"}"#)]);
+        assert_eq!(at(&base).wait_for_link(&fast(), &off), LinkOutcome::Expired);
+        server.join().unwrap();
+        // A 429 only makes the next pause longer (here `Retry-After: 0`: the interval).
+        let (base, server) = fake_server(vec![(429, "Retry-After: 0\r\n", r#"{"error":"muitas tentativas"}"#), (200, "", SIGNED_IN)]);
+        assert!(matches!(at(&base).wait_for_link(&fast(), &off), LinkOutcome::SignedIn(_)));
+        server.join().unwrap();
+        // Any other refusal ends it, with the server's words.
+        let (base, server) = fake_server(vec![(500, "", r#"{"error":"falhou"}"#)]);
+        assert_eq!(at(&base).wait_for_link(&fast(), &off), LinkOutcome::Failed(LinkError::Failed("falhou".into())));
+        server.join().unwrap();
+        // The code's own time is up: nothing more is asked (nothing listens there).
+        let closed = closed_port_base();
+        let short = LinkCode { expires_in: Duration::from_millis(50), interval: Duration::from_secs(30), ..fast() };
+        let started = Instant::now();
+        assert_eq!(at(&closed).wait_for_link(&short, &off), LinkOutcome::Expired);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        // Cancelled: nothing is asked either, and it ends at once.
+        let started = Instant::now();
+        assert_eq!(at(&closed).wait_for_link(&fast(), &AtomicBool::new(true)), LinkOutcome::Cancelled);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        // No server: the network error ends it.
+        assert!(matches!(at(&closed).wait_for_link(&fast(), &off), LinkOutcome::Failed(LinkError::Failed(_))));
+    }
+
+    #[test]
+    fn signing_out_tells_the_server_with_the_token_and_never_waits_long() {
+        let (base, server) = fake_server(vec![(204, "", "")]);
+        assert_eq!(Client::at(&base, &base, "tok-123", http_agent(Duration::from_secs(5))).sign_out(), Ok(()));
+        let seen = server.join().unwrap();
+        assert_eq!(seen[0].line, "POST /api/auth/logout HTTP/1.1");
+        assert_eq!(seen[0].authorization.as_deref(), Some("Bearer tok-123"));
+        // A refusal, or no server: an error the callers ignore, and soon.
+        let (base, server) = fake_server(vec![(401, "", r#"{"error":"faça login"}"#)]);
+        assert!(Client::at(&base, &base, "old", http_agent(Duration::from_secs(5))).sign_out().is_err());
+        server.join().unwrap();
+        let closed = closed_port_base();
+        let started = Instant::now();
+        assert!(Client::at(&closed, &closed, "tok", http_agent(SIGN_OUT_TIMEOUT)).sign_out().is_err());
+        assert!(started.elapsed() <= SIGN_OUT_TIMEOUT + Duration::from_secs(2));
+        // Nothing to end without a token, and a token of another address is never sent.
+        assert_eq!(Client::at(&closed, "", "", http_agent(SIGN_OUT_TIMEOUT)).sign_out(), Ok(()));
+        assert!(Client::at(&closed, SITE, "tok", http_agent(SIGN_OUT_TIMEOUT)).sign_out().is_err());
+        assert_eq!(sign_out_on_server(&AgentConfig::default()), Ok(()));
+    }
+
+    #[test]
+    fn no_code_path_asks_for_a_secret_word_any_more() {
+        // Spelt in pieces, so that this test does not find itself.
+        let word = concat!("pass", "word");
+        let sources = [("agent.rs", include_str!("agent.rs")), ("main.rs", include_str!("main.rs")), ("gui.rs", include_str!("gui.rs")), ("tray.rs", include_str!("tray.rs"))];
+        for (name, text) in sources {
+            assert!(!text.to_ascii_lowercase().contains(word), "{name} still mentions it");
+        }
+        // Nor the old sign-in route.
+        assert!(!include_str!("agent.rs").contains(concat!("agent", "-login")));
+        assert!(!include_str!("main.rs").contains(concat!("WIKELINK_", "PASS")));
+    }
+
+    // ----- blueprints in old logs ---------------------------------------------------------
+
+    fn blueprint_line(at: &str, name: &str) -> String {
+        format!(
+            "<{at}> [Notice] <SHUDEvent_OnNotification> Added notification \"Received Blueprint: {name}: \" [3] to queue. New queue size: 1, MissionId: [00000000-0000-0000-0000-000000000000], ObjectiveId: [] [Team_CoreGameplayFeatures][Missions][Comms]\n"
+        )
+    }
+
+    /// The name the game gives its `i`-th backup (a higher `i` is a newer one).
+    fn backup_name(i: usize) -> String {
+        format!("Game Build(12881860) {:02} Oct 26 (13 27 {:02}).log", 1 + i / 60, i % 60)
+    }
+
+    /// A backup log with these blueprints, after a line that is not one.
+    fn write_backup(dir: &Path, i: usize, blueprints: &[&str]) -> PathBuf {
+        let p = dir.join(backup_name(i));
+        let mut text = String::from("<2026-10-01T13:27:00.000Z> [Notice] <StatObjLoad 0x800 Format> whatever\n");
+        for name in blueprints {
+            text.push_str(&blueprint_line("2026-10-01T14:00:00.000Z", name));
+        }
+        std::fs::write(&p, text).unwrap();
+        p
+    }
+
+    /// One pass as the LIVE channel of `account`; `ok: false` refuses every batch. The
+    /// accepted events go into `sent`.
+    fn pass_with(state: &Path, dir: &Path, account: &str, ok: bool, sent: &mut Vec<(bool, TrackerOutput)>) -> BacklogPass {
+        let parser = wikelo_log::LineParser::new();
+        let stop = AtomicBool::new(false);
+        let mut send = |chunk: &[(bool, TrackerOutput)]| -> Result<(), BacklogSendError> {
+            if !ok {
+                return Err(BacklogSendError::Later("offline".into()));
+            }
+            sent.extend(chunk.iter().cloned());
+            Ok(())
+        };
+        backlog_pass(state, account, "LIVE", dir, &parser, &stop, &mut send)
+    }
+
+    fn sent_names(sent: &[(bool, TrackerOutput)]) -> Vec<String> {
+        sent.iter()
+            .map(|(_, e)| match e {
+                TrackerOutput::BlueprintReceived { name, .. } => name.clone(),
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect()
+    }
+
+    fn listing(dir: &Path) -> Vec<(String, u64)> {
+        let mut v: Vec<(String, u64)> =
+            std::fs::read_dir(dir).unwrap().flatten().map(|e| (e.file_name().to_string_lossy().into_owned(), e.metadata().unwrap().len())).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn a_pass_sends_the_blueprints_of_old_logs_newest_first_and_writes_nothing_there() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (game, data) = (tmp.path().join("logbackups"), tmp.path().join("data"));
+        std::fs::create_dir_all(&game).unwrap();
+        write_backup(&game, 0, &["Old One"]);
+        write_backup(&game, 1, &[]);
+        write_backup(&game, 2, &["New One", "New Two"]);
+        std::fs::write(game.join("notes.txt"), "not a log").unwrap();
+        let before = listing(&game);
+        let state = data.join("logbackups-read.json");
+        let mut sent = Vec::new();
+        let pass = pass_with(&state, &game, "TestPilot", true, &mut sent);
+        assert_eq!(pass, BacklogPass { read: 3, blueprints: 3, refused: 0, failed: 0, left: 0 });
+        assert_eq!(sent_names(&sent), vec!["New One", "New Two", "Old One"]);
+        assert!(sent.iter().all(|(replay, e)| *replay
+            && matches!(e, TrackerOutput::BlueprintReceived { at, mission_id: None, .. } if at == "2026-10-01T14:00:00.000Z")));
+        assert_eq!(listing(&game), before, "the game's folder is left as it was");
+        // Only the list is in the data folder: every temporary file was renamed over it.
+        assert_eq!(listing(&data).into_iter().map(|(n, _)| n).collect::<Vec<_>>(), vec!["logbackups-read.json"]);
+    }
+
+    #[test]
+    fn files_already_read_are_skipped_and_a_changed_size_is_read_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let game = tmp.path().join("logbackups");
+        std::fs::create_dir_all(&game).unwrap();
+        let state = tmp.path().join("logbackups-read.json");
+        write_backup(&game, 0, &["First"]);
+        let grows = write_backup(&game, 1, &["Second"]);
+        let mut sent = Vec::new();
+        assert_eq!(pass_with(&state, &game, "TestPilot", true, &mut sent).read, 2);
+        sent.clear();
+        let again = pass_with(&state, &game, "TestPilot", true, &mut sent);
+        assert_eq!(again, BacklogPass::default(), "nothing new");
+        assert!(sent.is_empty());
+        std::fs::write(&grows, format!("{}{}", std::fs::read_to_string(&grows).unwrap(), blueprint_line("2026-10-01T15:00:00.000Z", "Third"))).unwrap();
+        let changed = pass_with(&state, &game, "TestPilot", true, &mut sent);
+        assert_eq!((changed.read, changed.blueprints), (1, 2));
+        assert_eq!(sent_names(&sent), vec!["Second", "Third"]);
+    }
+
+    #[test]
+    fn the_list_of_read_files_survives_a_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let game = tmp.path().join("logbackups");
+        std::fs::create_dir_all(&game).unwrap();
+        let state = tmp.path().join("logbackups-read.json");
+        let p = write_backup(&game, 0, &["First"]);
+        let mut sent = Vec::new();
+        pass_with(&state, &game, "TestPilot", true, &mut sent);
+        // A new process: only what is on disk.
+        let size = std::fs::metadata(&p).unwrap().len();
+        let loaded = BacklogState::load(&state, "TestPilot");
+        assert!(loaded.is_read("LIVE", &backup_name(0), size));
+        assert!(!loaded.is_read("PTU", &backup_name(0), size), "per channel");
+        sent.clear();
+        assert_eq!(pass_with(&state, &game, "TestPilot", true, &mut sent).read, 0);
+        // Another account starts from nothing; an unreadable list too.
+        assert_eq!(BacklogState::load(&state, "Someone"), BacklogState { account: "Someone".into(), ..Default::default() });
+        std::fs::write(&state, "{ half").unwrap();
+        assert_eq!(pass_with(&state, &game, "TestPilot", true, &mut sent).read, 1);
+        // A file gone from the folder leaves the list.
+        std::fs::remove_file(&p).unwrap();
+        write_backup(&game, 1, &[]);
+        pass_with(&state, &game, "TestPilot", true, &mut sent);
+        let loaded = BacklogState::load(&state, "TestPilot");
+        assert_eq!(loaded.channels["LIVE"].keys().cloned().collect::<Vec<_>>(), vec![backup_name(1)]);
+    }
+
+    #[test]
+    fn a_failed_send_leaves_the_file_unread() {
+        let tmp = tempfile::tempdir().unwrap();
+        let game = tmp.path().join("logbackups");
+        std::fs::create_dir_all(&game).unwrap();
+        let state = tmp.path().join("logbackups-read.json");
+        write_backup(&game, 0, &["Older"]);
+        write_backup(&game, 1, &["Newer"]);
+        let mut sent = Vec::new();
+        let failed = pass_with(&state, &game, "TestPilot", false, &mut sent);
+        assert_eq!(failed, BacklogPass { read: 0, blueprints: 0, refused: 0, failed: 1, left: 0 }, "the pass ends at the first refusal");
+        assert!(BacklogState::load(&state, "TestPilot").channels.is_empty());
+        let next = pass_with(&state, &game, "TestPilot", true, &mut sent);
+        assert_eq!(next.read, 2);
+        assert_eq!(sent_names(&sent), vec!["Newer", "Older"]);
+    }
+
+    #[test]
+    fn a_pass_reads_at_most_200_files_the_newest_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let game = tmp.path().join("logbackups");
+        std::fs::create_dir_all(&game).unwrap();
+        let state = tmp.path().join("logbackups-read.json");
+        let total = BACKLOG_FILES_PER_PASS + 3;
+        for i in 0..total {
+            write_backup(&game, i, &[]);
+        }
+        let mut sent = Vec::new();
+        let first = pass_with(&state, &game, "TestPilot", true, &mut sent);
+        assert_eq!(first, BacklogPass { read: BACKLOG_FILES_PER_PASS, blueprints: 0, refused: 0, failed: 0, left: 3 });
+        let loaded = BacklogState::load(&state, "TestPilot");
+        let read = &loaded.channels["LIVE"];
+        assert!(read.contains_key(&backup_name(total - 1)) && !read.contains_key(&backup_name(0)), "the oldest wait");
+        let second = pass_with(&state, &game, "TestPilot", true, &mut sent);
+        assert_eq!(second, BacklogPass { read: 3, blueprints: 0, refused: 0, failed: 0, left: 0 });
+    }
+
+    #[test]
+    fn events_go_out_in_bounded_batches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let game = tmp.path().join("logbackups");
+        std::fs::create_dir_all(&game).unwrap();
+        let names: Vec<String> = (0..BACKLOG_BATCH + 5).map(|i| format!("Blueprint {i}")).collect();
+        write_backup(&game, 0, &names.iter().map(String::as_str).collect::<Vec<_>>());
+        let parser = wikelo_log::LineParser::new();
+        let stop = AtomicBool::new(false);
+        let mut sizes = Vec::new();
+        let mut send = |chunk: &[(bool, TrackerOutput)]| -> Result<(), BacklogSendError> {
+            sizes.push(chunk.len());
+            Ok(())
+        };
+        let pass = backlog_pass(&tmp.path().join("logbackups-read.json"), "TestPilot", "LIVE", &game, &parser, &stop, &mut send);
+        assert_eq!(pass.blueprints, BACKLOG_BATCH + 5);
+        assert_eq!(sizes, vec![BACKLOG_BATCH, 5]);
+    }
+
+    /// A pass whose `send` answers `refuse` for a batch with a blueprint named `bad` and
+    /// accepts every other one into `sent`.
+    fn pass_refusing(state: &Path, dir: &Path, bad: &str, refuse: BacklogSendError, sent: &mut Vec<(bool, TrackerOutput)>) -> BacklogPass {
+        let parser = wikelo_log::LineParser::new();
+        let stop = AtomicBool::new(false);
+        let mut send = |chunk: &[(bool, TrackerOutput)]| -> Result<(), BacklogSendError> {
+            if chunk.iter().any(|(_, e)| matches!(e, TrackerOutput::BlueprintReceived { name, .. } if name == bad)) {
+                return Err(refuse.clone());
+            }
+            sent.extend(chunk.iter().cloned());
+            Ok(())
+        };
+        backlog_pass(state, "TestPilot", "LIVE", dir, &parser, &stop, &mut send)
+    }
+
+    #[test]
+    fn a_refused_file_is_set_aside_and_the_next_one_is_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let game = tmp.path().join("logbackups");
+        std::fs::create_dir_all(&game).unwrap();
+        let state = tmp.path().join("logbackups-read.json");
+        write_backup(&game, 0, &["Older"]);
+        let bad = write_backup(&game, 1, &["Refused"]);
+        let mut sent = Vec::new();
+        let pass = pass_refusing(&state, &game, "Refused", BacklogSendError::Refused("HTTP 400".into()), &mut sent);
+        assert_eq!(pass, BacklogPass { read: 1, blueprints: 1, refused: 1, failed: 0, left: 0 });
+        assert_eq!(sent_names(&sent), vec!["Older"], "the older file is still read");
+        // The refused file counts as read: the next pass sends nothing again.
+        let size = std::fs::metadata(&bad).unwrap().len();
+        assert!(BacklogState::load(&state, "TestPilot").is_read("LIVE", &backup_name(1), size));
+        sent.clear();
+        assert_eq!(pass_refusing(&state, &game, "Refused", BacklogSendError::Refused("HTTP 400".into()), &mut sent), BacklogPass::default());
+        assert!(sent.is_empty());
+    }
+
+    #[test]
+    fn a_network_error_ends_the_pass_and_leaves_the_files_unread() {
+        let tmp = tempfile::tempdir().unwrap();
+        let game = tmp.path().join("logbackups");
+        std::fs::create_dir_all(&game).unwrap();
+        let state = tmp.path().join("logbackups-read.json");
+        write_backup(&game, 0, &["Older"]);
+        write_backup(&game, 1, &["Unlucky"]);
+        let mut sent = Vec::new();
+        let pass = pass_refusing(&state, &game, "Unlucky", BacklogSendError::Later("timeout".into()), &mut sent);
+        assert_eq!(pass, BacklogPass { read: 0, blueprints: 0, refused: 0, failed: 1, left: 0 });
+        assert!(sent.is_empty(), "the older file waits for the next pass");
+        assert!(BacklogState::load(&state, "TestPilot").channels.is_empty());
+    }
+
+    #[test]
+    fn a_repeated_event_in_one_file_goes_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let game = tmp.path().join("logbackups");
+        std::fs::create_dir_all(&game).unwrap();
+        let p = write_backup(&game, 0, &["Twice", "Twice", "Other"]);
+        // The same name at another time is another event.
+        std::fs::write(&p, format!("{}{}", std::fs::read_to_string(&p).unwrap(), blueprint_line("2026-10-01T15:00:00.000Z", "Twice"))).unwrap();
+        let mut sent = Vec::new();
+        let pass = pass_with(&tmp.path().join("logbackups-read.json"), &game, "TestPilot", true, &mut sent);
+        assert_eq!(pass.blueprints, 3);
+        assert_eq!(sent_names(&sent), vec!["Twice", "Other", "Twice"]);
+    }
+
+    #[test]
+    fn backlog_answers_are_classified() {
+        assert_eq!(backlog_verdict(Ok(Ack { enabled: true })), Ok(()));
+        assert!(matches!(backlog_verdict(Ok(Ack { enabled: false })), Err(BacklogSendError::Later(_))), "paused from the site");
+        let refusal = |status: u16| backlog_verdict(Err((Some(status), SendError::Rejected("no".into()))));
+        for status in [400, 403, 404, 413, 422, 451] {
+            assert!(matches!(refusal(status), Err(BacklogSendError::Refused(_))), "{status}");
+        }
+        for status in [401, 408, 409, 429, 500, 502, 503] {
+            assert!(matches!(refusal(status), Err(BacklogSendError::Later(_))), "{status}");
+        }
+        assert!(matches!(backlog_verdict(Err((None, SendError::Other("timeout".into())))), Err(BacklogSendError::Later(_))), "no answer");
+        assert!(matches!(backlog_verdict(Err((Some(200), SendError::Other("bad json".into())))), Err(BacklogSendError::Later(_))));
+        assert!(!is_final_refusal(None) && !is_final_refusal(Some(399)) && !is_final_refusal(Some(500)));
+    }
+
+    #[test]
+    fn a_refusal_of_the_events_request_keeps_its_status() {
+        for (status, kind) in [(400u16, "refused"), (413, "refused"), (422, "refused"), (429, "later"), (503, "later")] {
+            let (base, server) = fake_server(vec![(status, "", r#"{"error":"no"}"#)]);
+            let client = Client::at(&base, &base, "tok", http_agent(Duration::from_secs(5)));
+            let answer = client.send_with_status("LIVE", "pc", false, &[]);
+            assert!(matches!(answer, Err((Some(s), _)) if s == status), "{status}");
+            let verdict = backlog_verdict(answer);
+            match kind {
+                "refused" => assert!(matches!(verdict, Err(BacklogSendError::Refused(_))), "{status}: {verdict:?}"),
+                _ => assert!(matches!(verdict, Err(BacklogSendError::Later(_))), "{status}: {verdict:?}"),
+            }
+            server.join().unwrap();
+        }
+        // No server at all: no status, and the pass would end.
+        let closed = closed_port_base();
+        let answer = Client::at(&closed, &closed, "tok", http_agent(Duration::from_secs(5))).send_with_status("LIVE", "pc", false, &[]);
+        assert!(matches!(answer, Err((None, _))));
     }
 }

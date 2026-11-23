@@ -1,5 +1,8 @@
-//! What `GET /api/channels/{channel}/overlay` answers, and the text the overlay draws from
-//! it. Everything here is plain data and string formatting, testable without a window.
+//! What `GET /api/channels/{channel}/overlay` answers (and the search index, the inventory, the
+//! channel's locations and one blueprint's detail), and the text the overlay draws from it,
+//! including the blueprints card: its list, and the craft of the open blueprint computed with
+//! `wikelo_core::craft` at the qualities the player chose. Everything here is plain data and
+//! string formatting, testable without a window.
 //!
 //! Deserialization is lenient on purpose: every field has a default, unknown fields are
 //! ignored, `null` reads as the default and a number may come as an integer, a float or a
@@ -8,6 +11,8 @@
 use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Deserializer};
+use wikelo_core::craft;
+use wikelo_core::{MAX_BLUEPRINT_VALUE, MAX_QUALITY, QualityBand, QualityEffect, QualityRange, QualityRangeKind, QualityTiers};
 
 use crate::{tr, trf};
 
@@ -37,6 +42,18 @@ pub struct OverlayData {
     /// Reward choices waiting for the player, oldest first (empty from an older server).
     #[serde(deserialize_with = "lenient")]
     pub choices: Vec<Choice>,
+    // The answer's `blueprints` (pinned blueprints, from before the card listed them all) is
+    // not read: nothing about blueprints is pinned in the overlay.
+    /// How many blueprints of the channel can be obtained, and how many of those the account
+    /// has (`None` from an older server: the card's header line is not drawn).
+    #[serde(deserialize_with = "opt_number")]
+    pub blueprints_obtainable: Option<f64>,
+    #[serde(deserialize_with = "opt_number")]
+    pub blueprints_acquired: Option<f64>,
+    /// The keys of every blueprint the account has, default ones included (`None` from an
+    /// older server: the card does not say which ones the player has).
+    #[serde(deserialize_with = "opt_strings")]
+    pub acquired_blueprints: Option<Vec<String>>,
 }
 
 /// A pinned mission and what it pays.
@@ -134,6 +151,22 @@ pub struct OverlayIndex {
     pub version: String,
     pub items: Vec<IndexItem>,
     pub missions: Vec<IndexMission>,
+    /// Every blueprint of the channel (empty from an older server).
+    pub blueprints: Vec<IndexBlueprint>,
+}
+
+/// A blueprint of the index: its key, the name drawn (the crafted item's, else the key), a
+/// short label of what it makes (`kind`, empty from an older server) and what the index says
+/// of it (`obtainable` `None`: it does not say).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct IndexBlueprint {
+    pub blueprint: String,
+    pub name: String,
+    pub kind: String,
+    pub obtainable: Option<bool>,
+    pub is_default: bool,
+    folded: String,
+    lower: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -162,6 +195,23 @@ struct RawIndex {
     items: Vec<RawIndexItem>,
     #[serde(deserialize_with = "lenient")]
     missions: Vec<RawIndexMission>,
+    #[serde(deserialize_with = "lenient")]
+    blueprints: Vec<RawIndexBlueprint>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct RawIndexBlueprint {
+    #[serde(deserialize_with = "lenient")]
+    blueprint: String,
+    #[serde(deserialize_with = "lenient")]
+    name: String,
+    #[serde(deserialize_with = "lenient")]
+    kind: String,
+    #[serde(deserialize_with = "lenient")]
+    obtainable: Option<bool>,
+    #[serde(rename = "default", deserialize_with = "lenient")]
+    is_default: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -300,6 +350,16 @@ fn lenient<'de, D: Deserializer<'de>, T: serde::de::DeserializeOwned + Default>(
     Ok(serde_json::from_value(v).unwrap_or_default())
 }
 
+/// A list read entry by entry: an entry that does not read is skipped (the others stay);
+/// anything but a list is empty.
+fn lenient_list<'de, D: Deserializer<'de>, T: serde::de::DeserializeOwned>(d: D) -> Result<Vec<T>, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(match v {
+        serde_json::Value::Array(list) => list.into_iter().filter_map(|e| serde_json::from_value(e).ok()).collect(),
+        _ => Vec::new(),
+    })
+}
+
 /// A number as JSON number or numeric string; anything else is 0.
 fn number<'de, D: Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
     Ok(opt_number(d)?.unwrap_or(0.0))
@@ -321,6 +381,22 @@ fn opt_int<'de, D: Deserializer<'de>>(d: D) -> Result<Option<i64>, D::Error> {
     Ok(match v {
         serde_json::Value::Number(n) => n.as_i64(),
         serde_json::Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    })
+}
+
+/// A list of strings, its other entries skipped; anything but a list is `None`.
+fn opt_strings<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<String>>, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(match v {
+        serde_json::Value::Array(list) => Some(
+            list.into_iter()
+                .filter_map(|e| match e {
+                    serde_json::Value::String(s) => Some(s),
+                    _ => None,
+                })
+                .collect(),
+        ),
         _ => None,
     })
 }
@@ -382,7 +458,8 @@ pub fn parse_search(body: &[u8]) -> Result<SearchResults, String> {
     Ok(r)
 }
 
-/// Most items and missions kept of an index (a dataset has a few thousand).
+/// Most items, missions and blueprints (of each) kept of an index (a dataset has a few
+/// thousand).
 pub const MAX_INDEX_ROWS: usize = 50_000;
 
 /// Parse an index and fold its names once. Rows without a usable id are dropped; ids are
@@ -421,7 +498,25 @@ pub fn parse_index(body: &[u8]) -> Result<OverlayIndex, String> {
             IndexMission { mission_id: m.mission_id, title: m.title, giver: m.giver, folded, lower }
         })
         .collect();
-    Ok(OverlayIndex { version: raw.version, items, missions })
+    // The key goes back in the detail's URL: never cut (see `blueprint_usable`); the name
+    // drawn is the crafted item's, else the key, cut like any drawn text; the kind is cut short
+    // (it sits beside the name on one row).
+    let blueprints = raw
+        .blueprints
+        .into_iter()
+        .filter(|b| id_usable(&b.blueprint))
+        .take(MAX_INDEX_ROWS)
+        .map(|b| {
+            let mut name = if b.name.trim().is_empty() { b.blueprint.clone() } else { b.name };
+            cap(&mut name);
+            let mut kind = b.kind.trim().to_string();
+            cut(&mut kind, MAX_KIND_CHARS);
+            let folded = fold_search(&name);
+            let lower = name.to_lowercase();
+            IndexBlueprint { blueprint: b.blueprint, name, kind, obtainable: b.obtainable, is_default: b.is_default, folded, lower }
+        })
+        .collect();
+    Ok(OverlayIndex { version: raw.version, items, missions, blueprints })
 }
 
 // ----- inventory ------------------------------------------------------------------------
@@ -639,6 +734,7 @@ pub const ITEM_ROWS_MAX: usize = 50;
 /// [`mission_rows`]): the items, those the player owns first (per the inventory answer, when
 /// there is one) and then by name, at most [`ITEM_ROWS_MAX`]; the missions by title, at most
 /// [`MAX_RESULTS`]; and how many of each matched in all (the counts of the filter chips).
+/// Blueprints are searched only in their own card (see [`blueprint_list`]).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Found {
     pub items: Vec<SearchItem>,
@@ -773,7 +869,7 @@ fn fold_char(c: char) -> char {
 /// then the rest, each by name; the missions by title (see [`Found`]). A query without a
 /// word finds nothing.
 pub fn search_index(index: &OverlayIndex, query: &str, held: Option<&HashMap<String, Owned>>) -> Found {
-    let words: Vec<String> = fold_search(query).split_whitespace().map(str::to_string).collect();
+    let words = query_words(query);
     if words.is_empty() {
         return Found::default();
     }
@@ -790,6 +886,11 @@ pub fn search_index(index: &OverlayIndex, query: &str, held: Option<&HashMap<Str
     }
 }
 
+/// The words of a query, folded like the names (see [`fold_search`]).
+fn query_words(query: &str) -> Vec<String> {
+    fold_search(query).split_whitespace().map(str::to_string).collect()
+}
+
 /// Most rows of each list the overlay keeps from an answer, and the longest text.
 pub const MAX_TRACKED: usize = 200;
 pub const MAX_MISSING: usize = 200;
@@ -797,6 +898,12 @@ pub const MAX_NOTICES: usize = 20;
 /// Pinned missions and reward choices kept of an answer.
 pub const MAX_MISSIONS: usize = 50;
 pub const MAX_CHOICES: usize = 5;
+/// Keys kept of the answer's list of the blueprints the account has.
+pub const MAX_ACQUIRED: usize = 3_000;
+/// Longest blueprint key this overlay sends in a detail request (see [`blueprint_usable`]).
+pub const MAX_BLUEPRINT_CHARS: usize = 120;
+/// Longest kind of a blueprint kept (it sits beside the name on one row).
+pub const MAX_KIND_CHARS: usize = 24;
 /// Missions the search lists, and the rows of each kind kept of a server's search answer.
 pub const MAX_RESULTS: usize = 40;
 /// Sources, places and contracts of one row; changes of one notice.
@@ -809,6 +916,23 @@ pub const MAX_ID_CHARS: usize = MAX_CHARS;
 /// An id the overlay may use in a request: not blank, at most [`MAX_ID_CHARS`] characters.
 pub fn id_usable(id: &str) -> bool {
     !id.trim().is_empty() && id.chars().count() <= MAX_ID_CHARS
+}
+
+/// A blueprint key this overlay sends in a detail request: 1 to [`MAX_BLUEPRINT_CHARS`] of
+/// `A-Z a-z 0-9 _ . -` (the route's pattern). For any other key no request is sent and the
+/// row cannot be opened.
+pub fn blueprint_usable(key: &str) -> bool {
+    (1..=MAX_BLUEPRINT_CHARS).contains(&key.len()) && key.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+}
+
+/// Longest contract id this overlay sends to the mission route (see [`contract_usable`]).
+pub const MAX_CONTRACT_CHARS: usize = 128;
+
+/// A contract id this overlay sends to the mission route: not blank, 1 to
+/// [`MAX_CONTRACT_CHARS`] characters, no control character and no `/` (the route's rule). For
+/// any other id no request is sent and the mission line cannot be opened.
+pub fn contract_usable(id: &str) -> bool {
+    !id.trim().is_empty() && id.chars().count() <= MAX_CONTRACT_CHARS && !id.chars().any(|c| c.is_control() || c == '/')
 }
 
 /// Most a move part may carry.
@@ -835,7 +959,12 @@ pub fn change_usable(change: &Local) -> bool {
 
 /// Cut a string to [`MAX_CHARS`] characters (on a character boundary).
 fn cap(s: &mut String) {
-    if let Some((at, _)) = s.char_indices().nth(MAX_CHARS) {
+    cut(s, MAX_CHARS);
+}
+
+/// Cut a string to `max` characters (on a character boundary).
+fn cut(s: &mut String, max: usize) {
+    if let Some((at, _)) = s.char_indices().nth(max) {
         s.truncate(at);
     }
 }
@@ -917,6 +1046,12 @@ pub fn bound(d: &mut OverlayData) {
         for o in &mut c.options {
             cap(&mut o.name);
         }
+    }
+    // Compared with the index's keys, never drawn: a key too long to be one is dropped, never
+    // cut (a cut key could match another blueprint).
+    if let Some(list) = &mut d.acquired_blueprints {
+        list.retain(|k| id_usable(k));
+        list.truncate(MAX_ACQUIRED);
     }
 }
 
@@ -1422,6 +1557,1000 @@ pub fn reward_line(r: &Reward) -> String {
     format!("{}× {}", qty(r.qty), r.name)
 }
 
+/// Longest craft time shown, in seconds (about 115 days); a longer one is shown as this.
+pub const MAX_CRAFT_SECS: f64 = 10_000_000.0;
+
+/// How long a craft takes: `45 s`, `2 min 30 s`, `1 h 05 min` (from an hour on, to the
+/// nearest minute), at most [`MAX_CRAFT_SECS`]; `None` without a time (0, negative or not a
+/// number).
+pub fn craft_time(sec: f64) -> Option<String> {
+    if !sec.is_finite() || sec <= 0.0 {
+        return None;
+    }
+    // Bounded before any arithmetic, so a huge value never overflows below.
+    let sec = sec.min(MAX_CRAFT_SECS);
+    // At least one second: a craft time under half a second is not "0 s".
+    let total = (sec.round() as u64).max(1);
+    Some(if total >= 3600 {
+        let minutes = total.saturating_add(30) / 60;
+        let (h, m) = (minutes / 60, minutes % 60);
+        if m == 0 { trf!("{h} h", "{h} h") } else { trf!("{h} h {m:02} min", "{h} h {m:02} min") }
+    } else if total >= 60 {
+        let (m, s) = (total / 60, total % 60);
+        if s == 0 { trf!("{m} min", "{m} min") } else { trf!("{m} min {s:02} s", "{m} min {s:02} s") }
+    } else {
+        trf!("{total} s", "{total} s")
+    })
+}
+
+/// A material's quantity as drawn: SCU with up to 2 decimals (`0.5`, `1.25`, `3`), units as
+/// whole numbers; below zero or not a number is 0.
+pub fn material_qty(n: f64, scu: bool) -> String {
+    let n = if n.is_finite() && n > 0.0 { n } else { 0.0 };
+    if scu {
+        let s = format!("{n:.2}");
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
+    } else {
+        format!("{}", n.round() as i64)
+    }
+}
+
+/// `0.5 / 1.25 SCU`, `3 / 4 un.`: what the player has of a material against what one craft
+/// needs.
+pub fn material_amount(o: &CraftOption) -> String {
+    let (have, need) = (material_qty(o.have, o.scu), material_qty(o.need, o.scu));
+    if o.scu { trf!("{have} / {need} SCU", "{have} / {need} SCU") } else { trf!("{have} / {need} pcs", "{have} / {need} un.") }
+}
+
+/// The player has less of the material than one craft needs, compared as drawn (see
+/// [`material_qty`]): `0.999 / 1 SCU` is drawn `1 / 1 SCU` and is not short.
+pub fn material_short(o: &CraftOption) -> bool {
+    let scale = if o.scu { 100.0 } else { 1.0 };
+    let drawn = |n: f64| if n.is_finite() && n > 0.0 { (n * scale).round() } else { 0.0 };
+    drawn(o.have) < drawn(o.need)
+}
+
+/// The material's name, with the least quality the craft accepts when there is one:
+/// `Iron · qualidade ≥ 500`.
+pub fn material_label(o: &CraftOption) -> String {
+    let name = &o.name;
+    if o.min_quality > 0 {
+        let q = o.min_quality;
+        trf!("{name} · quality ≥ {q}", "{name} · qualidade ≥ {q}")
+    } else {
+        name.clone()
+    }
+}
+
+/// A chance (0 to 1) as a whole percent: `25%`, `<1%` for a chance above 0 that rounds to
+/// 0, at most `100%`; below zero or not a number is `0%`.
+pub fn chance_text(chance: f64) -> String {
+    if !chance.is_finite() || chance <= 0.0 {
+        return "0%".into();
+    }
+    let pct = (chance.min(1.0) * 100.0).round() as i64;
+    if pct == 0 { "<1%".into() } else { format!("{pct}%") }
+}
+
+/// Largest count drawn in the card's header.
+pub const MAX_COUNT: f64 = 1_000_000.0;
+
+/// A count as drawn: whole, at least 0, at most [`MAX_COUNT`].
+fn count(n: f64) -> i64 {
+    if n.is_finite() && n > 0.0 { n.round().min(MAX_COUNT) as i64 } else { 0 }
+}
+
+/// The card's header line, `adquiridas 12 de 340`, only when the server sends both counts.
+pub fn acquired_line(d: &OverlayData) -> Option<String> {
+    let (acquired, obtainable) = (count(d.blueprints_acquired?), count(d.blueprints_obtainable?));
+    Some(trf!("acquired {acquired} of {obtainable}", "adquiridas {acquired} de {obtainable}"))
+}
+
+// ----- the blueprints card: the list ------------------------------------------------------
+
+/// Whether the account has a blueprint, as its row says first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BpHave {
+    /// In the account's list.
+    Have,
+    /// Every player has it (counts as had).
+    Default,
+    /// Not in the account's list.
+    NotHave,
+    /// The server sends no list (an older one): nothing can be said.
+    Unknown,
+}
+
+impl BpHave {
+    /// Counts as had (the filter "Adquiridas").
+    pub fn had(self) -> bool {
+        matches!(self, BpHave::Have | BpHave::Default)
+    }
+
+    /// The mark before the word: filled when had, empty when not (never colour alone).
+    pub fn mark(self) -> &'static str {
+        match self {
+            BpHave::Have | BpHave::Default => "●",
+            BpHave::NotHave => "○",
+            BpHave::Unknown => "·",
+        }
+    }
+
+    /// The state in a word.
+    pub fn word(self) -> &'static str {
+        match self {
+            BpHave::Have => tr!("acquired", "adquirida"),
+            BpHave::Default => tr!("default", "padrão"),
+            BpHave::NotHave => tr!("not acquired", "não adquirida"),
+            BpHave::Unknown => tr!("unknown", "sem dado"),
+        }
+    }
+
+    /// The mark and the word, as the row draws them: `● adquirida`.
+    pub fn text(self) -> String {
+        format!("{} {}", self.mark(), self.word())
+    }
+}
+
+/// The card's filter: every blueprint, the ones had, or the ones not had.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BpFilter {
+    #[default]
+    All,
+    Have,
+    NotHave,
+}
+
+impl BpFilter {
+    pub const ALL: [BpFilter; 3] = [BpFilter::All, BpFilter::Have, BpFilter::NotHave];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            BpFilter::All => tr!("All", "Todas"),
+            BpFilter::Have => tr!("Acquired", "Adquiridas"),
+            BpFilter::NotHave => tr!("Not acquired", "Não adquiridas"),
+        }
+    }
+
+    fn passes(self, have: BpHave) -> bool {
+        match self {
+            BpFilter::All => true,
+            BpFilter::Have => have.had(),
+            BpFilter::NotHave => have == BpHave::NotHave,
+        }
+    }
+}
+
+/// Whether the account has `b`: a default one always; else per `acquired` (the keys of the
+/// overlay's `acquired_blueprints`, `None` from an older server).
+pub fn blueprint_have(b: &IndexBlueprint, acquired: Option<&HashSet<&str>>) -> BpHave {
+    if b.is_default {
+        return BpHave::Default;
+    }
+    match acquired {
+        Some(keys) if keys.contains(b.blueprint.as_str()) => BpHave::Have,
+        Some(_) => BpHave::NotHave,
+        None => BpHave::Unknown,
+    }
+}
+
+/// The card's list: every blueprint of the index whose name has every word of `query`
+/// (ignoring case and accents, like the overlay's search; no word: all of them) and that
+/// passes `filter`, sorted by name (then by key), each with whether the account has it.
+/// Positions in `list`, so the rows are drawn from the index itself.
+pub fn blueprint_list(list: &[IndexBlueprint], query: &str, filter: BpFilter, acquired: Option<&[String]>) -> Vec<(usize, BpHave)> {
+    let keys: Option<HashSet<&str>> = acquired.map(|l| l.iter().map(String::as_str).collect());
+    let words = query_words(query);
+    let mut out: Vec<(usize, BpHave)> = list
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| words.iter().all(|w| b.folded.contains(w.as_str())))
+        .map(|(i, b)| (i, blueprint_have(b, keys.as_ref())))
+        .filter(|(_, have)| filter.passes(*have))
+        .collect();
+    out.sort_by(|(a, _), (b, _)| {
+        let (a, b) = (&list[*a], &list[*b]);
+        (a.lower.as_str(), a.blueprint.as_str()).cmp(&(b.lower.as_str(), b.blueprint.as_str()))
+    });
+    out
+}
+
+/// What the end of a row shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WhereCell {
+    /// "Onde conseguir": it can be obtained and is not a default one.
+    Button,
+    /// "não disponível": nothing in the game gives it.
+    NotAvailable,
+    /// A default one: neither.
+    Nothing,
+}
+
+/// The end of `b`'s row. An index that does not say whether it can be obtained gets the
+/// button (the missions then say).
+pub fn where_cell(b: &IndexBlueprint) -> WhereCell {
+    if b.is_default {
+        WhereCell::Nothing
+    } else if b.obtainable == Some(false) {
+        WhereCell::NotAvailable
+    } else {
+        WhereCell::Button
+    }
+}
+
+/// The button that shows the missions.
+pub fn where_label() -> &'static str {
+    tr!("Where to get it", "Onde conseguir")
+}
+
+/// The label of a blueprint nothing in the game gives.
+pub fn not_available_label() -> &'static str {
+    tr!("not available", "não disponível")
+}
+
+// ----- the blueprints card: one blueprint's detail ------------------------------------------
+
+/// Most slots, options of a slot, tiers of an option, effects of a slot, ranges of an effect
+/// and missions kept of a blueprint's detail.
+pub const MAX_SLOTS: usize = 12;
+pub const MAX_OPTIONS: usize = 4;
+pub const MAX_TIERS: usize = 16;
+pub const MAX_EFFECTS: usize = 8;
+pub const MAX_RANGES: usize = 8;
+pub const MAX_SOURCES: usize = 30;
+/// Result lines drawn.
+pub const RESULT_LINES: usize = 8;
+/// Largest material quantity read (a larger one reads as this).
+pub const MAX_AMOUNT: f64 = 1_000_000_000.0;
+/// Largest multiplier drawn, and the largest number added (either way).
+pub const MAX_FACTOR: f64 = 1_000.0;
+pub const MAX_ADDITIVE: f64 = 1_000_000.0;
+
+/// Most facts kept of a blueprint's detail, and the longest label or value of one.
+pub const MAX_FACTS: usize = 8;
+pub const MAX_FACT_CHARS: usize = 64;
+
+/// What `GET /api/channels/{channel}/overlay/blueprint/{blueprint}` answers, as the card uses
+/// it: how long a craft takes, the mandatory slots, where to get it (the missions sent, and
+/// how many more there are) and what the server says of the crafted item (`facts`, worded in
+/// English by the server; empty from an older one).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BlueprintDetail {
+    pub craft_time_sec: f64,
+    pub slots: Vec<CraftSlot>,
+    pub sources: Vec<MissionSource>,
+    pub sources_more: u64,
+    pub facts: Vec<Fact>,
+}
+
+/// One fact of the crafted item: `Size` and `S2`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Fact {
+    pub label: String,
+    pub value: String,
+}
+
+/// One mandatory slot: its name, the materials that can fill it (in the record's order) and
+/// what its quality changes, ready for `wikelo_core::craft`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CraftSlot {
+    pub name: String,
+    pub options: Vec<CraftOption>,
+    pub effects: Vec<QualityEffect>,
+}
+
+/// One material a slot takes: `need` of it (in SCU when `scu`, else in units), the least
+/// quality accepted, what the account holds of it (`have`, every stack; `have_quality`: the
+/// best quality held that is enough, when known) and its quality tiers (those whose value
+/// reaches the minimum, ascending; no bands: the material has none).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CraftOption {
+    pub name: String,
+    pub need: f64,
+    pub scu: bool,
+    pub min_quality: i64,
+    pub have: f64,
+    pub have_quality: Option<i64>,
+    pub tiers: QualityTiers,
+}
+
+/// When a mission pays the blueprint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum When {
+    Accept,
+    Complete,
+}
+
+/// A mission that may pay the blueprint: its title, who gives it and when; its contract
+/// (`contract_id`, `None` from an older server or for an id the mission route does not take:
+/// the line then opens nothing); and the chance its reward gives a blueprint at all
+/// (`pool_chance`, only below 1: without it the mission always gives one of the pool's
+/// blueprints the player does not have yet).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MissionSource {
+    pub title: String,
+    pub giver: Option<String>,
+    pub when: Option<When>,
+    /// The server's chance for this one blueprint (0 to 1): read, never drawn. Every
+    /// blueprint of a pool has the same odds and none is given twice, so a per-blueprint
+    /// percentage says nothing useful.
+    #[allow(dead_code)]
+    pub chance: f64,
+    pub contract_id: Option<String>,
+    pub pool_chance: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct RawDetail {
+    #[serde(deserialize_with = "number")]
+    craft_time_sec: f64,
+    #[serde(deserialize_with = "lenient_list")]
+    slots: Vec<RawSlot>,
+    #[serde(deserialize_with = "lenient_list")]
+    sources: Vec<RawSource>,
+    #[serde(deserialize_with = "number")]
+    sources_more: f64,
+    #[serde(deserialize_with = "lenient_list")]
+    facts: Vec<RawFact>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+struct RawFact {
+    #[serde(deserialize_with = "lenient")]
+    label: String,
+    // A number (a grade) reads as its text.
+    #[serde(deserialize_with = "id_text")]
+    value: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct RawSlot {
+    #[serde(deserialize_with = "lenient")]
+    name: String,
+    #[serde(deserialize_with = "lenient_list")]
+    options: Vec<RawOption>,
+    #[serde(deserialize_with = "lenient_list")]
+    effects: Vec<RawEffect>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct RawOption {
+    #[serde(deserialize_with = "lenient")]
+    name: String,
+    #[serde(deserialize_with = "number")]
+    need: f64,
+    #[serde(deserialize_with = "lenient")]
+    unit: String,
+    #[serde(deserialize_with = "number")]
+    min_quality: f64,
+    #[serde(deserialize_with = "number")]
+    have: f64,
+    #[serde(deserialize_with = "opt_number")]
+    have_quality: Option<f64>,
+    #[serde(deserialize_with = "lenient_list")]
+    tiers: Vec<RawTier>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+struct RawTier {
+    #[serde(deserialize_with = "number")]
+    start: f64,
+    #[serde(deserialize_with = "number")]
+    end: f64,
+    #[serde(deserialize_with = "number")]
+    value: f64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+struct RawEffect {
+    #[serde(deserialize_with = "lenient")]
+    name: String,
+    #[serde(deserialize_with = "lenient_list")]
+    ranges: Vec<RawRange>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct RawRange {
+    #[serde(deserialize_with = "lenient")]
+    kind: String,
+    #[serde(deserialize_with = "number")]
+    start_quality: f64,
+    #[serde(deserialize_with = "number")]
+    end_quality: f64,
+    #[serde(deserialize_with = "number")]
+    at_start: f64,
+    #[serde(deserialize_with = "number")]
+    at_end: f64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+struct RawSource {
+    #[serde(deserialize_with = "lenient")]
+    title: String,
+    #[serde(deserialize_with = "lenient")]
+    giver: Option<String>,
+    #[serde(deserialize_with = "lenient")]
+    when: String,
+    #[serde(deserialize_with = "number")]
+    chance: f64,
+    #[serde(rename = "contractId", deserialize_with = "lenient")]
+    contract_id: Option<String>,
+    #[serde(rename = "poolChance", deserialize_with = "opt_number")]
+    pool_chance: Option<f64>,
+}
+
+/// A quality as the card uses it: whole, from 0 to the game's top (`MAX_QUALITY`); not a
+/// number is 0.
+fn quality_of(q: f64) -> i64 {
+    if q.is_finite() { q.round().clamp(0.0, MAX_QUALITY as f64) as i64 } else { 0 }
+}
+
+/// A material quantity: at least 0 (below zero or not a number is 0), at most [`MAX_AMOUNT`].
+fn amount_of(n: f64) -> f64 {
+    if n.is_finite() && n > 0.0 { n.min(MAX_AMOUNT) } else { 0.0 }
+}
+
+/// A value of an effect's range, at most the dataset's bound either way (so the product over
+/// every slot stays a finite number).
+fn effect_value(v: f64) -> f64 {
+    if v.is_finite() { v.clamp(-MAX_BLUEPRINT_VALUE, MAX_BLUEPRINT_VALUE) } else { 0.0 }
+}
+
+fn craft_option(o: RawOption) -> CraftOption {
+    let mut name = o.name;
+    cap(&mut name);
+    let min_quality = quality_of(o.min_quality);
+    let mut bands: Vec<QualityBand> =
+        o.tiers.into_iter().take(MAX_TIERS).map(|t| QualityBand { start: quality_of(t.start), end: quality_of(t.end), value: quality_of(t.value) }).collect();
+    bands.sort_by_key(|b| (b.start, b.end));
+    CraftOption {
+        tiers: QualityTiers { key: name.clone(), name: name.clone(), bands },
+        name,
+        need: amount_of(o.need),
+        scu: o.unit.trim().eq_ignore_ascii_case("scu"),
+        min_quality,
+        have: amount_of(o.have),
+        have_quality: o.have_quality.map(quality_of),
+    }
+}
+
+/// An effect for `wikelo_core::craft`, keyed by its name (the server sends the property's
+/// name, or its key when it has none); one without a name is left out (nothing to draw it
+/// by), and so are ranges of a kind this overlay does not know.
+fn quality_effect(e: RawEffect) -> Option<QualityEffect> {
+    let mut name = e.name.trim().to_string();
+    cap(&mut name);
+    if name.is_empty() {
+        return None;
+    }
+    let ranges = e
+        .ranges
+        .into_iter()
+        .take(MAX_RANGES)
+        .filter_map(|r| {
+            let kind = match r.kind.as_str() {
+                "linear" => QualityRangeKind::Linear,
+                "integerAdditive" => QualityRangeKind::IntegerAdditive,
+                _ => return None,
+            };
+            Some(QualityRange { kind, start_quality: quality_of(r.start_quality), end_quality: quality_of(r.end_quality), at_start: effect_value(r.at_start), at_end: effect_value(r.at_end) })
+        })
+        .collect();
+    Some(QualityEffect { key: name.clone(), name: Some(name), ranges })
+}
+
+/// When a reward pays, from the server's word (`accept` / `complete`; anything else is not
+/// said).
+fn when_of(s: &str) -> Option<When> {
+    match s {
+        "accept" => Some(When::Accept),
+        "complete" => Some(When::Complete),
+        _ => None,
+    }
+}
+
+/// A reward's chance of giving a blueprint at all, as kept: from 0 to below 1; `None` for 1
+/// or more (it always gives one) and for anything that is not a finite number.
+fn pool_chance_of(c: Option<f64>) -> Option<f64> {
+    c.filter(|c| c.is_finite() && *c < 1.0).map(|c| c.max(0.0))
+}
+
+/// A contract id as kept: whole when the mission route takes it (see [`contract_usable`]),
+/// else `None` (never cut: a cut id could name another contract).
+fn contract_of(id: Option<String>) -> Option<String> {
+    id.filter(|id| contract_usable(id))
+}
+
+/// The facts of a detail: trimmed, each label and value cut to [`MAX_FACT_CHARS`], those
+/// missing either left out, at most [`MAX_FACTS`], in the server's order.
+fn facts_of(raw: Vec<RawFact>) -> Vec<Fact> {
+    raw.into_iter()
+        .filter_map(|f| {
+            let (mut label, mut value) = (f.label.trim().to_string(), f.value.trim().to_string());
+            cut(&mut label, MAX_FACT_CHARS);
+            cut(&mut value, MAX_FACT_CHARS);
+            (!label.is_empty() && !value.is_empty()).then_some(Fact { label, value })
+        })
+        .take(MAX_FACTS)
+        .collect()
+}
+
+/// Parse a blueprint's detail, bounded ([`MAX_SLOTS`], [`MAX_OPTIONS`], [`MAX_TIERS`],
+/// [`MAX_EFFECTS`], [`MAX_RANGES`], [`MAX_SOURCES`], [`MAX_FACTS`], every string cut to
+/// [`MAX_CHARS`], a fact's to [`MAX_FACT_CHARS`]), numbers read leniently (not a number is 0,
+/// quantities never below 0, qualities from 0 to the game's top, a pool's chance from 0 to
+/// below 1). `Err` only for a body that is not a JSON object.
+pub fn parse_blueprint_detail(body: &[u8]) -> Result<BlueprintDetail, String> {
+    let v: serde_json::Value = serde_json::from_slice(body).map_err(unexpected_because)?;
+    if !v.is_object() {
+        return Err(unexpected());
+    }
+    let raw: RawDetail = serde_json::from_value(v).map_err(unexpected_because)?;
+    let slots = raw
+        .slots
+        .into_iter()
+        .take(MAX_SLOTS)
+        .map(|s| {
+            let mut name = s.name;
+            cap(&mut name);
+            CraftSlot {
+                name,
+                options: s.options.into_iter().take(MAX_OPTIONS).map(craft_option).collect(),
+                effects: s.effects.into_iter().take(MAX_EFFECTS).filter_map(quality_effect).collect(),
+            }
+        })
+        .collect();
+    let sources = raw
+        .sources
+        .into_iter()
+        .take(MAX_SOURCES)
+        .map(|s| {
+            let mut title = s.title;
+            cap(&mut title);
+            let giver = s.giver.map(|mut g| {
+                cap(&mut g);
+                g
+            });
+            MissionSource { title, giver, when: when_of(&s.when), chance: s.chance, contract_id: contract_of(s.contract_id), pool_chance: pool_chance_of(s.pool_chance) }
+        })
+        .collect();
+    Ok(BlueprintDetail { craft_time_sec: raw.craft_time_sec, slots, sources, sources_more: count(raw.sources_more) as u64, facts: facts_of(raw.facts) })
+}
+
+/// The moment a reward pays, in words.
+pub fn when_label(w: When) -> &'static str {
+    match w {
+        When::Accept => tr!("on accept", "ao aceitar"),
+        When::Complete => tr!("on completion", "ao concluir"),
+    }
+}
+
+/// A pool's chance as drawn after "nem sempre entrega": a whole percent (see
+/// [`chance_text`]), never `100%` (the chance is below 1, and 100% would say the opposite of
+/// the sentence).
+fn pool_percent(chance: f64) -> String {
+    if chance.is_finite() && chance < 1.0 && (chance * 100.0).round() >= 100.0 { "99%".into() } else { chance_text(chance) }
+}
+
+/// `nem sempre entrega (25%)`: a mission whose reward gives a blueprint only some of the time.
+pub fn not_always_text(chance: f64) -> String {
+    let pct = pool_percent(chance);
+    trf!("does not always give one ({pct})", "nem sempre entrega ({pct})")
+}
+
+/// Said once under the title of "Onde conseguir" and of a mission's blueprints.
+pub fn never_twice_note() -> &'static str {
+    tr!("A blueprint is never given twice.", "Uma blueprint nunca é entregue duas vezes.")
+}
+
+/// One mission of "Onde conseguir": `Bounty Hunt · Wikelo · ao concluir` (the giver and the
+/// moment only when known), ending with `nem sempre entrega (25%)` when its reward does not
+/// always give a blueprint. No percentage otherwise: every blueprint of a pool has the same
+/// odds and none is given twice.
+pub fn mission_line(s: &MissionSource) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let title = s.title.trim();
+    parts.push(if title.is_empty() { tr!("Mission", "Missão").to_string() } else { title.to_string() });
+    if let Some(g) = s.giver.as_deref().map(str::trim).filter(|g| !g.is_empty()) {
+        parts.push(g.to_string());
+    }
+    if let Some(w) = s.when {
+        parts.push(when_label(w).to_string());
+    }
+    if let Some(c) = s.pool_chance {
+        parts.push(not_always_text(c));
+    }
+    parts.join(" · ")
+}
+
+/// A fact's label as drawn: the server's English word translated by exact match; any other
+/// label as it came.
+pub fn fact_label(label: &str) -> &str {
+    match label {
+        "Type" => tr!("Type", "Tipo"),
+        "Size" => tr!("Size", "Tamanho"),
+        "Grade" => tr!("Grade", "Grau"),
+        "Class" => tr!("Class", "Classe"),
+        "Manufacturer" => tr!("Manufacturer", "Fabricante"),
+        other => other,
+    }
+}
+
+/// The facts on one line: `Tipo WeaponGun / Gun · Tamanho S2 · Fabricante Behring`; `None`
+/// without any.
+pub fn facts_line(facts: &[Fact]) -> Option<String> {
+    if facts.is_empty() {
+        return None;
+    }
+    Some(facts.iter().map(|f| format!("{} {}", fact_label(&f.label), f.value)).collect::<Vec<_>>().join(" · "))
+}
+
+/// `+12`: the missions beyond those listed; `None` when there are none.
+pub fn more_missions(n: u64) -> Option<String> {
+    (n > 0).then(|| format!("+{n}"))
+}
+
+// ----- the blueprints card: one mission's blueprints ----------------------------------------
+
+/// Most pools of a mission kept, and most blueprints of one pool.
+pub const MAX_POOLS: usize = 16;
+pub const MAX_POOL_BLUEPRINTS: usize = 200;
+
+/// What `GET /api/channels/{channel}/overlay/mission/{contract}/blueprints` answers: the
+/// mission's title and giver, and its pools (`accept` before `complete`, the larger first, as
+/// the server sorts them).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MissionBlueprints {
+    pub title: String,
+    pub giver: Option<String>,
+    pub pools: Vec<MissionPool>,
+}
+
+/// One pool of a mission: when it pays, the chance its reward gives a blueprint at all (only
+/// below 1), how many blueprints it has and how many of them the account has (`total` and
+/// `acquired` count them all, the list may be cut), and the blueprints, by name.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MissionPool {
+    pub when: Option<When>,
+    pub pool_chance: Option<f64>,
+    pub total: u64,
+    pub acquired: u64,
+    pub blueprints: Vec<PoolBlueprint>,
+}
+
+/// A blueprint of a pool: its key, the name and kind the index gives it, and whether the
+/// account has it (a default one counts as had).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PoolBlueprint {
+    pub blueprint: String,
+    pub name: String,
+    pub kind: String,
+    pub acquired: bool,
+    pub is_default: bool,
+}
+
+impl PoolBlueprint {
+    /// Whether the account has it, as the rows say it (see [`BpHave`]).
+    pub fn have(&self) -> BpHave {
+        if self.is_default {
+            BpHave::Default
+        } else if self.acquired {
+            BpHave::Have
+        } else {
+            BpHave::NotHave
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+struct RawMission {
+    #[serde(deserialize_with = "lenient")]
+    title: String,
+    #[serde(deserialize_with = "lenient")]
+    giver: Option<String>,
+    #[serde(deserialize_with = "lenient_list")]
+    pools: Vec<RawPool>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+struct RawPool {
+    #[serde(deserialize_with = "lenient")]
+    when: String,
+    #[serde(rename = "poolChance", deserialize_with = "opt_number")]
+    pool_chance: Option<f64>,
+    #[serde(deserialize_with = "number")]
+    total: f64,
+    #[serde(deserialize_with = "number")]
+    acquired: f64,
+    #[serde(deserialize_with = "lenient_list")]
+    blueprints: Vec<RawPoolBlueprint>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+struct RawPoolBlueprint {
+    #[serde(deserialize_with = "lenient")]
+    blueprint: String,
+    #[serde(deserialize_with = "lenient")]
+    name: String,
+    #[serde(deserialize_with = "lenient")]
+    kind: String,
+    #[serde(deserialize_with = "lenient")]
+    acquired: bool,
+    #[serde(rename = "default", deserialize_with = "lenient")]
+    is_default: bool,
+}
+
+/// Parse a mission's blueprints, bounded like the index ([`MAX_POOLS`] pools of at most
+/// [`MAX_POOL_BLUEPRINTS`]; a row without a usable key dropped, keys never cut; names cut to
+/// [`MAX_CHARS`], no name: the key; kinds trimmed and cut to [`MAX_KIND_CHARS`]); the counts
+/// whole, never fewer in all than listed, never more acquired than in all. `Err` only for a
+/// body that is not a JSON object.
+pub fn parse_mission_blueprints(body: &[u8]) -> Result<MissionBlueprints, String> {
+    let v: serde_json::Value = serde_json::from_slice(body).map_err(unexpected_because)?;
+    if !v.is_object() {
+        return Err(unexpected());
+    }
+    let raw: RawMission = serde_json::from_value(v).map_err(unexpected_because)?;
+    let mut title = raw.title;
+    cap(&mut title);
+    let giver = raw
+        .giver
+        .map(|mut g| {
+            cap(&mut g);
+            g
+        })
+        .filter(|g| !g.trim().is_empty());
+    let pools = raw
+        .pools
+        .into_iter()
+        .take(MAX_POOLS)
+        .map(|p| {
+            let blueprints: Vec<PoolBlueprint> = p
+                .blueprints
+                .into_iter()
+                .filter(|b| id_usable(&b.blueprint))
+                .take(MAX_POOL_BLUEPRINTS)
+                .map(|b| {
+                    let mut name = if b.name.trim().is_empty() { b.blueprint.clone() } else { b.name };
+                    cap(&mut name);
+                    let mut kind = b.kind.trim().to_string();
+                    cut(&mut kind, MAX_KIND_CHARS);
+                    PoolBlueprint { blueprint: b.blueprint, name, kind, acquired: b.acquired, is_default: b.is_default }
+                })
+                .collect();
+            let total = (count(p.total) as u64).max(blueprints.len() as u64);
+            let acquired = (count(p.acquired) as u64).min(total);
+            MissionPool { when: when_of(&p.when), pool_chance: pool_chance_of(p.pool_chance), total, acquired, blueprints }
+        })
+        .collect();
+    Ok(MissionBlueprints { title, giver, pools })
+}
+
+/// The title of a mission's screen.
+pub fn mission_screen_title() -> &'static str {
+    tr!("Mission blueprints", "Blueprints da missão")
+}
+
+/// A pool's heading: `ao concluir · 3 de 14 adquiridas` (the moment only when known).
+pub fn pool_heading(p: &MissionPool) -> String {
+    let (n, m) = (p.acquired, p.total);
+    let counts = trf!("{n} of {m} acquired", "{n} de {m} adquiridas");
+    match p.when {
+        Some(w) => format!("{} · {counts}", when_label(w)),
+        None => counts,
+    }
+}
+
+/// The lines under a pool's heading, in this order: `nem sempre entrega (25%)` when its
+/// reward does not always give a blueprint, and that the mission gives no more once every
+/// blueprint of the pool is had.
+pub fn pool_notes(p: &MissionPool) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(c) = p.pool_chance {
+        out.push(not_always_text(c));
+    }
+    if p.total > 0 && p.acquired >= p.total {
+        out.push(tr!("All acquired: this mission gives no more.", "Todas adquiridas: esta missão não entrega mais nenhuma.").to_string());
+    }
+    out
+}
+
+// ----- the blueprints card: the craft -------------------------------------------------------
+
+/// What the player chose for one slot: the option in use, the stop of its tier slider, and
+/// the quality typed (entered by hand, or for an option without tiers).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SlotChoice {
+    pub option: usize,
+    pub stop: usize,
+    pub quality: i64,
+}
+
+/// The choices of the open blueprint: "Informar manualmente" (`manual`: every slot takes a
+/// typed quality) and one choice per slot.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CraftState {
+    pub manual: bool,
+    pub slots: Vec<SlotChoice>,
+}
+
+/// A quality between `min` (itself within the game's scale) and the game's top.
+pub fn clamp_quality(q: i64, min: i64) -> i64 {
+    q.clamp(min.clamp(0, MAX_QUALITY), MAX_QUALITY)
+}
+
+/// The tier whose band holds `q`, if one does.
+fn tier_holding(o: &CraftOption, q: i64) -> Option<usize> {
+    o.tiers.bands.iter().position(|b| (b.start..=b.end).contains(&q))
+}
+
+/// The stop a slot starts on: the tier whose band holds the best quality held, else the one
+/// holding 500, else the lowest one.
+pub fn start_stop(o: &CraftOption) -> usize {
+    o.have_quality.and_then(|q| tier_holding(o, q)).or_else(|| tier_holding(o, craft::QUALITY_DEFAULT)).unwrap_or(0)
+}
+
+/// The quality a slot's typed field starts from: the value of [`start_stop`]; without tiers,
+/// the best quality held, else 500; within the option's minimum and the top.
+pub fn start_quality(o: &CraftOption) -> i64 {
+    let q = match o.tiers.bands.get(start_stop(o)) {
+        Some(b) => b.value,
+        None => o.have_quality.unwrap_or(craft::QUALITY_DEFAULT),
+    };
+    clamp_quality(q, o.min_quality)
+}
+
+/// The stop for a raw quality: the tier whose band holds it, else the nearest one (the lower
+/// on a tie), as `wikelo_core::craft::tier_band` finds it; 0 without tiers.
+pub fn stop_for_quality(o: &CraftOption, q: i64) -> usize {
+    craft::tier_band(&o.tiers, q).and_then(|band| o.tiers.bands.iter().position(|b| std::ptr::eq(b, band))).unwrap_or(0)
+}
+
+/// A slot on option `option`, at its start (see [`start_stop`], [`start_quality`]).
+fn choice_on(o: Option<&CraftOption>, option: usize) -> SlotChoice {
+    match o {
+        Some(o) => SlotChoice { option, stop: start_stop(o), quality: start_quality(o) },
+        None => SlotChoice { option, stop: 0, quality: craft::QUALITY_DEFAULT },
+    }
+}
+
+impl CraftState {
+    /// Every slot on its first option, at its start, on the tier sliders.
+    pub fn start(d: &BlueprintDetail) -> Self {
+        Self { manual: false, slots: d.slots.iter().map(|s| choice_on(s.options.first(), 0)).collect() }
+    }
+
+    /// The choices still fit `d` (another answer for the same blueprint may have other slots).
+    pub fn fits(&self, d: &BlueprintDetail) -> bool {
+        self.slots.len() == d.slots.len() && self.slots.iter().zip(&d.slots).all(|(c, s)| s.options.is_empty() || c.option < s.options.len())
+    }
+}
+
+/// The slot shows its tier slider (or its single tier) rather than a typed quality.
+pub fn on_tiers(o: &CraftOption, manual: bool) -> bool {
+    !manual && !o.tiers.bands.is_empty()
+}
+
+/// The quality the computation uses for a slot: the chosen tier's value, or the typed
+/// quality within the option's minimum and the top.
+pub fn slot_quality(o: &CraftOption, c: &SlotChoice, manual: bool) -> i64 {
+    match o.tiers.bands.get(c.stop.min(o.tiers.bands.len().saturating_sub(1))) {
+        Some(b) if on_tiers(o, manual) => b.value,
+        _ => clamp_quality(c.quality, o.min_quality),
+    }
+}
+
+/// "Informar manualmente" switched to `on`: going manual, each slot with tiers starts its
+/// typed quality from the tier it was on; leaving it, each goes to the tier whose band holds
+/// the typed quality, or the nearest.
+pub fn with_manual(d: &BlueprintDetail, st: &CraftState, on: bool) -> CraftState {
+    let mut next = st.clone();
+    next.manual = on;
+    for (c, s) in next.slots.iter_mut().zip(&d.slots) {
+        let Some(o) = s.options.get(c.option) else { continue };
+        if o.tiers.bands.is_empty() {
+            continue;
+        }
+        if on {
+            c.quality = clamp_quality(slot_quality(o, c, false), o.min_quality);
+        } else {
+            c.stop = stop_for_quality(o, clamp_quality(c.quality, o.min_quality));
+        }
+    }
+    next
+}
+
+/// Slot `slot` on option `option`: the quality reached is kept, on the new material's tiers
+/// (the nearest) or within its minimum.
+pub fn with_option(d: &BlueprintDetail, st: &CraftState, slot: usize, option: usize) -> CraftState {
+    let mut next = st.clone();
+    if let Some(s) = d.slots.get(slot)
+        && let Some(new) = s.options.get(option)
+        && let Some(c) = next.slots.get_mut(slot)
+    {
+        let q = s.options.get(c.option).map_or(craft::QUALITY_DEFAULT, |o| slot_quality(o, c, st.manual));
+        *c = SlotChoice { option, stop: stop_for_quality(new, q), quality: clamp_quality(q, new.min_quality) };
+    }
+    next
+}
+
+/// Slot `slot`'s tier slider moved to `stop`.
+pub fn with_stop(st: &CraftState, slot: usize, stop: usize) -> CraftState {
+    let mut next = st.clone();
+    if let Some(c) = next.slots.get_mut(slot) {
+        c.stop = stop;
+    }
+    next
+}
+
+/// Slot `slot`'s typed quality set to `q`, within its option's minimum and the top.
+pub fn with_quality(d: &BlueprintDetail, st: &CraftState, slot: usize, q: i64) -> CraftState {
+    let mut next = st.clone();
+    if let (Some(s), Some(c)) = (d.slots.get(slot), next.slots.get_mut(slot)) {
+        let min = s.options.get(c.option).map_or(0, |o| o.min_quality);
+        c.quality = clamp_quality(q, min);
+    }
+    next
+}
+
+/// What the crafted item gets at the chosen qualities, through `wikelo_core::craft`
+/// (`combine_craft` over the slots that have a material and effects), one line per property
+/// (`Recoil Kick ×0.97`, `Ammo +2`, `Spread ×1.05 -1`), at most [`RESULT_LINES`]. A multiplier
+/// is drawn with 2 decimals, never below 0 nor above [`MAX_FACTOR`]; a number added is whole
+/// and signed, at most [`MAX_ADDITIVE`] either way.
+pub fn craft_result(d: &BlueprintDetail, st: &CraftState) -> Vec<String> {
+    let parts: Vec<craft::CraftPart<'_>> = d
+        .slots
+        .iter()
+        .zip(&st.slots)
+        .filter(|(s, _)| !s.effects.is_empty())
+        .filter_map(|(s, c)| Some(craft::CraftPart { effects: &s.effects, quality: slot_quality(s.options.get(c.option)?, c, st.manual) }))
+        .collect();
+    craft::combine_craft(&parts)
+        .into_iter()
+        .filter_map(|t| {
+            let mut values: Vec<String> = Vec::new();
+            // A product too large to be a number reads as the bound (an infinity is clamped).
+            if let Some(m) = t.multiplier.filter(|m| !m.is_nan()) {
+                let m = m.clamp(0.0, MAX_FACTOR);
+                // A -0.0 (equal to 0.0) is drawn as 0, never `×-0.00`.
+                let m = if m == 0.0 { 0.0 } else { m };
+                values.push(format!("×{m:.2}"));
+            }
+            if let Some(a) = t.added {
+                values.push(format!("{:+}", a.clamp(-(MAX_ADDITIVE as i64), MAX_ADDITIVE as i64)));
+            }
+            (!values.is_empty()).then(|| format!("{} {}", t.name, values.join(" ")))
+        })
+        .take(RESULT_LINES)
+        .collect()
+}
+
+/// Every material in use is there for one craft (compared as drawn, see [`material_short`]);
+/// `false` for a blueprint without any material.
+pub fn craft_ready(d: &BlueprintDetail, st: &CraftState) -> bool {
+    let mut any = false;
+    for (s, c) in d.slots.iter().zip(&st.slots) {
+        let Some(o) = s.options.get(c.option) else { continue };
+        any = true;
+        if material_short(o) {
+            return false;
+        }
+    }
+    any
+}
+
 /// A change the player made in the overlay, drawn at once while its request is on its way.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Local {
@@ -1907,6 +3036,407 @@ mod tests {
         assert_eq!(o.iter().map(|o| o.qty).collect::<Vec<_>>(), vec![Some(3.0), None, Some(1.0), None]);
         assert_eq!(o.iter().map(option_label).collect::<Vec<_>>(), vec!["3× Armor A", "Armor B", "1× C", "D"]);
         assert_eq!(d.choices[0].qty, 2.0, "the choice's own quantity stays for older overlays");
+    }
+
+    #[test]
+    fn only_keys_the_detail_route_takes_are_sent() {
+        assert!(blueprint_usable("BP_CRAFT_behr-rifle.01"));
+        assert!(blueprint_usable(&"B".repeat(MAX_BLUEPRINT_CHARS)));
+        let too_long = "B".repeat(MAX_BLUEPRINT_CHARS + 1);
+        for bad in ["", " ", "BP a", "BP/a", "BPé", too_long.as_str()] {
+            assert!(!blueprint_usable(bad), "{bad:?}");
+        }
+    }
+
+    const NEW_BLUEPRINTS: &str = r#"{
+      "blueprintsObtainable": 340, "blueprintsAcquired": "12",
+      "acquiredBlueprints": ["BP_a", 5, "BP_c", null],
+      "blueprints": [ { "blueprint": "BP_a", "name": "P4-AR Rifle", "materials": [ { "name": "Iron" } ] } ]
+    }"#;
+
+    #[test]
+    fn the_overlay_read_says_what_the_account_has_and_its_pinned_blueprints_are_not_read() {
+        let d = parse(NEW_BLUEPRINTS.as_bytes()).unwrap();
+        assert_eq!((d.blueprints_obtainable, d.blueprints_acquired), (Some(340.0), Some(12.0)), "a numeric string is a number");
+        assert_eq!(acquired_line(&d).as_deref(), Some("adquiridas 12 de 340"));
+        assert_eq!(d.acquired_blueprints, Some(vec!["BP_a".to_string(), "BP_c".to_string()]), "what is not a string is skipped");
+        // The old `blueprints` list (pins) is ignored: the answer reads as if it were not there.
+        let without: serde_json::Value = {
+            let mut v: serde_json::Value = serde_json::from_str(NEW_BLUEPRINTS).unwrap();
+            v.as_object_mut().unwrap().remove("blueprints");
+            v
+        };
+        assert_eq!(d, parse(without.to_string().as_bytes()).unwrap());
+    }
+
+    #[test]
+    fn an_older_server_says_nothing_of_the_blueprints_had() {
+        let d = parse(SAMPLE.as_bytes()).unwrap();
+        assert_eq!((acquired_line(&d), d.acquired_blueprints.clone()), (None, None), "no header line, nothing known of what is had");
+        // One count alone is no header either; odd values read as not sent.
+        for body in [r#"{"blueprintsAcquired": 3}"#, r#"{"blueprintsAcquired": 3, "blueprintsObtainable": "NaN"}"#, r#"{"blueprintsAcquired": 3, "blueprintsObtainable": "inf"}"#, r#"{"blueprintsAcquired": [3], "blueprintsObtainable": 9}"#] {
+            assert_eq!(acquired_line(&parse(body.as_bytes()).unwrap()), None, "{body}");
+        }
+        for v in ["null", "\"BP_a\"", "{}"] {
+            assert_eq!(parse(format!(r#"{{"acquiredBlueprints":{v}}}"#).as_bytes()).unwrap().acquired_blueprints, None, "{v}");
+        }
+    }
+
+    #[test]
+    fn chances_and_counts_never_make_a_long_or_broken_line() {
+        for (chance, text) in [(0.25, "25%"), (0.004, "<1%"), (0.0, "0%"), (-1.0, "0%"), (f64::NAN, "0%"), (f64::INFINITY, "0%"), (7.0, "100%"), (1e300, "100%"), (0.996, "100%")] {
+            assert_eq!(chance_text(chance), text, "{chance}");
+        }
+        // Counts: whole, at least 0, bounded.
+        let counts = |acquired: f64, obtainable: f64| acquired_line(&OverlayData { blueprints_acquired: Some(acquired), blueprints_obtainable: Some(obtainable), ..Default::default() });
+        assert_eq!(counts(-3.0, 1e300).as_deref(), Some("adquiridas 0 de 1000000"));
+        assert_eq!(counts(2.6, f64::NAN).as_deref(), Some("adquiridas 3 de 0"));
+    }
+
+    #[test]
+    fn the_list_of_blueprints_had_is_bounded_and_its_keys_never_cut() {
+        let key_too_long = "K".repeat(MAX_ID_CHARS + 1);
+        let mut acquired: Vec<serde_json::Value> = vec![serde_json::json!(key_too_long)];
+        acquired.extend((0..MAX_ACQUIRED + 500).map(|n| serde_json::json!(format!("BP_{n}"))));
+        let d = parse(serde_json::json!({ "acquiredBlueprints": acquired }).to_string().as_bytes()).unwrap();
+        let list = d.acquired_blueprints.as_ref().unwrap();
+        assert_eq!(list.len(), MAX_ACQUIRED);
+        assert_eq!(list[0], "BP_0", "a key too long to be sent is dropped, never cut");
+        const { assert!(MAX_ACQUIRED == 3_000) };
+    }
+
+    fn blueprint_index() -> OverlayIndex {
+        let body = serde_json::json!({
+            "items": [ { "itemId": "i", "name": "Rifle Parts" } ],
+            "blueprints": [
+                { "blueprint": "BP_rifle", "name": "P4-AR Rifle Água", "obtainable": true, "default": false, "kind": "Weapon", "extra": 1 },
+                { "blueprint": "BP_def", "name": "Default Knife", "default": true, "kind": "Weapon" },
+                { "blueprint": "BP_none", "name": "Rifle Prototype", "obtainable": false, "kind": 7 },
+                { "blueprint": "", "name": "no key" },
+                { "blueprint": "BP_noname", "name": "", "kind": "  Ship weapon with a very long label  " },
+                { "name": "no key either" },
+                { "blueprint": "K".repeat(MAX_ID_CHARS + 1), "name": "too long a key" },
+                { "blueprint": "BP_armor", "name": "ADP Armor", "obtainable": true, "kind": "Armour" }
+            ]
+        });
+        parse_index(body.to_string().as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn the_index_lists_the_blueprints_with_their_kind() {
+        let index = blueprint_index();
+        assert_eq!(index.blueprints.iter().map(|b| b.blueprint.as_str()).collect::<Vec<_>>(), vec!["BP_rifle", "BP_def", "BP_none", "BP_noname", "BP_armor"], "rows without a usable key dropped");
+        assert_eq!(index.blueprints[3].name, "BP_noname", "no name: its key");
+        assert_eq!((index.blueprints[1].obtainable, index.blueprints[1].is_default), (None, true));
+        assert_eq!((index.blueprints[2].obtainable, index.blueprints[2].is_default), (Some(false), false));
+        assert_eq!(index.blueprints.iter().map(|b| b.kind.as_str()).collect::<Vec<_>>(), vec!["Weapon", "Weapon", "", "Ship weapon with a very ", "Armour"], "trimmed and cut short; not a string: none");
+        // The global search lists no blueprints any more: they are searched in their card.
+        let r = search_index(&index, "rifle", None);
+        assert_eq!((r.item_count, r.mission_count), (1, 0));
+        // An older server's index: no kind, or no blueprints at all, still reads.
+        let old = parse_index(br#"{"blueprints":[{"blueprint":"BP_a","name":"A","obtainable":true}]}"#).unwrap();
+        assert_eq!((old.blueprints.len(), old.blueprints[0].kind.as_str()), (1, ""));
+        assert!(parse_index(br#"{"items":[]}"#).unwrap().blueprints.is_empty());
+        assert!(parse_index(br#"{"blueprints":"x"}"#).unwrap().blueprints.is_empty());
+    }
+
+    fn keys(index: &OverlayIndex, rows: &[(usize, BpHave)]) -> Vec<String> {
+        rows.iter().map(|(i, _)| index.blueprints[*i].blueprint.clone()).collect()
+    }
+
+    #[test]
+    fn the_card_lists_every_blueprint_by_name_and_finds_them_by_folded_words() {
+        let index = blueprint_index();
+        let had = vec!["BP_rifle".to_string(), "BP_gone".to_string()];
+        let list = |q: &str, f: BpFilter| blueprint_list(&index.blueprints, q, f, Some(had.as_slice()));
+        assert_eq!(keys(&index, &list("", BpFilter::All)), vec!["BP_armor", "BP_noname", "BP_def", "BP_rifle", "BP_none"], "no word: every one, by name ignoring case");
+        assert_eq!(keys(&index, &list("RIFLE", BpFilter::All)), vec!["BP_rifle", "BP_none"]);
+        assert_eq!(keys(&index, &list("agua rifle", BpFilter::All)), vec!["BP_rifle"], "accents ignored, every word in any order");
+        assert_eq!(keys(&index, &list("ÁGUA", BpFilter::All)), vec!["BP_rifle"]);
+        assert!(list("zzz", BpFilter::All).is_empty());
+        assert_eq!(keys(&index, &list("  ", BpFilter::All)).len(), 5, "blank: no word");
+        // The filter: a default one counts as had.
+        assert_eq!(keys(&index, &list("", BpFilter::Have)), vec!["BP_def", "BP_rifle"]);
+        assert_eq!(keys(&index, &list("", BpFilter::NotHave)), vec!["BP_armor", "BP_noname", "BP_none"]);
+        assert_eq!(keys(&index, &list("rifle", BpFilter::NotHave)), vec!["BP_none"]);
+        let states: Vec<BpHave> = list("", BpFilter::All).into_iter().map(|(_, h)| h).collect();
+        assert_eq!(states, vec![BpHave::NotHave, BpHave::NotHave, BpHave::Default, BpHave::Have, BpHave::NotHave]);
+        // Without the server's list: nothing known but the default ones.
+        let unknown = blueprint_list(&index.blueprints, "", BpFilter::All, None);
+        assert_eq!(unknown.iter().map(|(_, h)| *h).collect::<Vec<_>>(), vec![BpHave::Unknown, BpHave::Unknown, BpHave::Default, BpHave::Unknown, BpHave::Unknown]);
+        assert_eq!(keys(&index, &blueprint_list(&index.blueprints, "", BpFilter::Have, None)), vec!["BP_def"]);
+        assert!(blueprint_list(&index.blueprints, "", BpFilter::NotHave, None).is_empty(), "nothing is known not to be had");
+        // Thousands of them: every one listed (the card draws only the rows in view).
+        let many: Vec<serde_json::Value> = (0..3000).rev().map(|n| serde_json::json!({ "blueprint": format!("BP_{n:04}"), "name": format!("Scrap {n:04}") })).collect();
+        let big = parse_index(serde_json::json!({ "blueprints": many }).to_string().as_bytes()).unwrap();
+        let rows = blueprint_list(&big.blueprints, "scrap", BpFilter::All, Some(&[]));
+        assert_eq!(rows.len(), 3000);
+        assert_eq!((big.blueprints[rows[0].0].name.as_str(), big.blueprints[rows[2999].0].name.as_str()), ("Scrap 0000", "Scrap 2999"));
+    }
+
+    #[test]
+    fn a_row_says_first_whether_the_account_has_it_in_a_mark_and_a_word() {
+        assert_eq!([BpHave::Have, BpHave::Default, BpHave::NotHave, BpHave::Unknown].map(BpHave::text), ["● adquirida", "● padrão", "○ não adquirida", "· sem dado"], "never colour alone");
+        assert!(BpHave::Have.had() && BpHave::Default.had() && !BpHave::NotHave.had() && !BpHave::Unknown.had());
+        assert_eq!(BpFilter::ALL.map(BpFilter::label), ["Todas", "Adquiridas", "Não adquiridas"]);
+        assert_eq!(BpFilter::default(), BpFilter::All);
+        let index = blueprint_index();
+        let cell = |key: &str| where_cell(index.blueprints.iter().find(|b| b.blueprint == key).unwrap());
+        assert_eq!(cell("BP_rifle"), WhereCell::Button, "obtainable, not default");
+        assert_eq!(cell("BP_def"), WhereCell::Nothing, "default: neither");
+        assert_eq!(cell("BP_none"), WhereCell::NotAvailable);
+        assert_eq!(cell("BP_noname"), WhereCell::Button, "the index does not say: the missions will");
+        assert_eq!((where_label(), not_available_label()), ("Onde conseguir", "não disponível"));
+    }
+
+    const DETAIL: &str = r#"{
+      "blueprint": "BP_rifle", "name": "P4-AR Rifle", "craftTimeSec": 90,
+      "acquired": false, "default": false, "obtainable": true,
+      "slots": [
+        { "name": "Frame",
+          "options": [
+            { "name": "Agricium", "need": 1.25, "unit": "scu", "minQuality": 400, "have": 2, "haveQuality": 874,
+              "tiers": [ { "start": 400, "end": 599, "value": 588 }, { "start": 600, "end": 699, "value": 667 }, { "start": 800, "end": 899, "value": 852 } ] },
+            { "name": "Iron", "need": 4, "unit": "unit", "minQuality": 0, "have": 1, "haveQuality": null, "tiers": [] } ],
+          "effects": [ { "name": "Recoil Kick", "ranges": [ { "kind": "linear", "startQuality": 0, "endQuality": 1000, "atStart": 1.1, "atEnd": 0.9 } ] } ] },
+        { "name": "Barrel",
+          "options": [ { "name": "Gem", "need": 2, "unit": "unit", "minQuality": 0, "have": 3, "haveQuality": null,
+              "tiers": [ { "start": 0, "end": 399, "value": 346 }, { "start": 400, "end": 599, "value": 588 } ] } ],
+          "effects": [ { "name": "Ammo", "ranges": [ { "kind": "integerAdditive", "startQuality": 0, "endQuality": 1000, "atStart": 0, "atEnd": 4 } ] },
+                       { "name": "Recoil Kick", "ranges": [ { "kind": "linear", "startQuality": 0, "endQuality": 1000, "atStart": 1, "atEnd": 1 } ] } ] }
+      ],
+      "sources": [ { "title": "Bounty Hunt", "giver": "Wikelo", "when": "complete", "chance": 0.25 },
+                   { "title": "Salvage", "giver": null, "when": "accept", "chance": "0.004" },
+                   { "title": "", "when": "later", "chance": 1 } ],
+      "sourcesMore": 12,
+      "somethingNew": { "a": 1 }
+    }"#;
+
+    fn detail() -> BlueprintDetail {
+        parse_blueprint_detail(DETAIL.as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn reads_the_detail_of_a_blueprint() {
+        let d = detail();
+        assert_eq!((d.craft_time_sec, d.slots.len(), d.sources.len(), d.sources_more), (90.0, 2, 3, 12));
+        let o = &d.slots[0].options[0];
+        assert_eq!((o.name.as_str(), o.need, o.scu, o.min_quality, o.have, o.have_quality), ("Agricium", 1.25, true, 400, 2.0, Some(874)));
+        assert_eq!(o.tiers.bands, vec![QualityBand { start: 400, end: 599, value: 588 }, QualityBand { start: 600, end: 699, value: 667 }, QualityBand { start: 800, end: 899, value: 852 }]);
+        let iron = &d.slots[0].options[1];
+        assert_eq!((iron.scu, iron.have_quality, iron.tiers.bands.len()), (false, None, 0));
+        let e = &d.slots[1].effects[0];
+        assert_eq!((e.key.as_str(), e.name.as_deref(), e.ranges[0].kind), ("Ammo", Some("Ammo"), QualityRangeKind::IntegerAdditive));
+        assert_eq!(d.sources[1], MissionSource { title: "Salvage".into(), giver: None, when: Some(When::Accept), chance: 0.004, contract_id: None, pool_chance: None });
+        assert_eq!(d.sources[2].when, None, "an unknown moment is not said");
+        assert_eq!(d.sources.iter().map(mission_line).collect::<Vec<_>>(), vec!["Bounty Hunt · Wikelo · ao concluir", "Salvage · ao aceitar", "Missão"], "no per-blueprint percentage");
+        assert_eq!((more_missions(d.sources_more).as_deref(), more_missions(0)), (Some("+12"), None));
+        assert_eq!(craft_time(d.craft_time_sec).as_deref(), Some("1 min 30 s"));
+    }
+
+    #[test]
+    fn a_hostile_detail_is_bounded_and_never_breaks() {
+        assert!(parse_blueprint_detail(b"[]").is_err() && parse_blueprint_detail(b"<html>").is_err());
+        assert_eq!(parse_blueprint_detail(b"{}").unwrap(), BlueprintDetail::default(), "empty lists");
+        let long = "x".repeat(MAX_CHARS + 50);
+        let tiers: Vec<serde_json::Value> = (0..500).rev().map(|n| serde_json::json!({ "start": n, "end": n, "value": n })).collect();
+        let range = serde_json::json!({ "kind": "linear", "startQuality": -5, "endQuality": 1e300, "atStart": 1e300, "atEnd": "NaN" });
+        let effect = serde_json::json!({ "name": long, "ranges": vec![range; 20] });
+        let option = serde_json::json!({ "name": long, "need": 1e300, "unit": "SCU ", "minQuality": 1e300, "have": -4, "haveQuality": "inf", "tiers": tiers });
+        let slot = serde_json::json!({ "name": long, "options": vec![option; 9], "effects": vec![effect; 20] });
+        let mut slots = vec![slot; MAX_SLOTS + 5];
+        slots[1] = serde_json::json!({ "name": "no options", "options": [] });
+        slots[2] = serde_json::json!(7);
+        let body = serde_json::json!({
+            "craftTimeSec": 1e300, "sourcesMore": 1e300,
+            "slots": slots,
+            "sources": vec![serde_json::json!({ "title": long, "giver": long, "chance": 1e300 }); MAX_SOURCES + 40],
+        });
+        let d = parse_blueprint_detail(body.to_string().as_bytes()).unwrap();
+        assert_eq!(d.slots.len(), MAX_SLOTS, "a slot that is not an object is skipped, the rest kept");
+        assert!(d.slots[1].options.is_empty(), "a slot without options stays");
+        let s = &d.slots[0];
+        assert_eq!((s.options.len(), s.effects.len(), s.effects[0].ranges.len()), (MAX_OPTIONS, MAX_EFFECTS, MAX_RANGES));
+        assert_eq!(s.name.chars().count(), MAX_CHARS);
+        let o = &s.options[0];
+        assert_eq!(o.tiers.bands.len(), MAX_TIERS, "500 tiers: 16 kept");
+        assert!(o.tiers.bands.windows(2).all(|w| w[0].start <= w[1].start), "ascending");
+        assert_eq!((o.need, o.have, o.min_quality, o.have_quality, o.scu), (MAX_AMOUNT, 0.0, MAX_QUALITY, None, true));
+        let r = &s.effects[0].ranges[0];
+        assert_eq!((r.start_quality, r.end_quality, r.at_start, r.at_end), (0, MAX_QUALITY, MAX_BLUEPRINT_VALUE, 0.0));
+        assert_eq!((d.sources.len(), d.sources_more), (MAX_SOURCES, MAX_COUNT as u64));
+        assert!(d.sources.iter().all(|src| src.title.chars().count() == MAX_CHARS && src.giver.as_ref().is_some_and(|g| g.chars().count() == MAX_CHARS)));
+        assert!(!mission_line(&d.sources[0]).contains('%'), "a chance of 1e300 draws no percentage");
+        assert_eq!(craft_time(d.craft_time_sec).as_deref(), Some("2777 h 47 min"));
+        assert_eq!(material_amount(o), "0 / 1000000000 SCU");
+        // The craft over it stays finite and bounded.
+        let st = CraftState::start(&d);
+        assert!(st.fits(&d));
+        let lines = craft_result(&d, &st);
+        assert!(!lines.is_empty() && lines.len() <= RESULT_LINES && lines.iter().all(|l| l.ends_with("×1000.00")), "a product past the bound reads as the bound: {lines:?}");
+        assert!(!craft_ready(&d, &st), "1e300 needed, nothing held");
+        // Odd shapes read as empty.
+        let odd = parse_blueprint_detail(br#"{"slots":"x","sources":{"a":1},"craftTimeSec":"soon","sourcesMore":-3}"#).unwrap();
+        assert_eq!(odd, BlueprintDetail::default());
+        let unknown_kind = parse_blueprint_detail(br#"{"slots":[{"name":"S","options":[{"name":"A"}],"effects":[{"name":"P","ranges":[{"kind":"cubic"}]},{"name":" ","ranges":[{"kind":"linear"}]}]}]}"#).unwrap();
+        assert_eq!(unknown_kind.slots[0].effects.len(), 1, "an effect without a name is left out");
+        assert!(unknown_kind.slots[0].effects[0].ranges.is_empty(), "a range of an unknown kind is left out");
+    }
+
+    #[test]
+    fn a_slot_starts_on_the_tier_of_the_best_quality_held_else_500_else_the_lowest() {
+        let d = detail();
+        let agricium = &d.slots[0].options[0];
+        assert_eq!((start_stop(agricium), start_quality(agricium)), (2, 852), "874 held: its band");
+        let mut o = agricium.clone();
+        o.have_quality = Some(750);
+        assert_eq!(start_stop(&o), 0, "no band holds 750: the one holding 500");
+        o.have_quality = None;
+        assert_eq!((start_stop(&o), start_quality(&o)), (0, 588));
+        o.tiers.bands.remove(0);
+        assert_eq!((start_stop(&o), start_quality(&o)), (0, 667), "no band holds 500 either: the lowest stop");
+        // Without tiers: the quality held, else 500, within the minimum and the top.
+        let iron = &d.slots[0].options[1];
+        assert_eq!(start_quality(iron), 500);
+        let mut held = iron.clone();
+        held.have_quality = Some(940);
+        assert_eq!(start_quality(&held), 940);
+        held.have_quality = None;
+        held.min_quality = 700;
+        assert_eq!(start_quality(&held), 700);
+        let st = CraftState::start(&d);
+        assert_eq!(st, CraftState { manual: false, slots: vec![SlotChoice { option: 0, stop: 2, quality: 852 }, SlotChoice { option: 0, stop: 1, quality: 588 }] });
+        assert!(st.fits(&d));
+        assert!(!CraftState::default().fits(&d), "other slots");
+        let mut fewer = d.clone();
+        fewer.slots[0].options.truncate(1);
+        assert!(!with_option(&d, &st, 0, 1).fits(&fewer), "an option that is gone");
+    }
+
+    #[test]
+    fn the_result_is_computed_by_the_core_from_the_chosen_qualities() {
+        let d = detail();
+        let st = CraftState::start(&d);
+        // Frame at 852: 1.1 - 0.2 × 0.852 = 0.9296; Barrel at 588: Ammo 2.352 → 2, Recoil ×1.
+        assert_eq!(craft_result(&d, &st), vec!["Recoil Kick ×0.93", "Ammo +2"]);
+        // The lowest tier of the frame: 1.1 - 0.2 × 0.588 = 0.9824.
+        let low = with_stop(&st, 0, 0);
+        assert_eq!(craft_result(&d, &low)[0], "Recoil Kick ×0.98");
+        assert_eq!(slot_quality(&d.slots[0].options[0], &low.slots[0], false), 588);
+        // Typed by hand: the number as typed, within the minimum and the top.
+        let manual = with_manual(&d, &low, true);
+        assert_eq!((manual.manual, manual.slots[0].quality, manual.slots[1].quality), (true, 588, 588), "starting from the tier each slot was on");
+        assert_eq!(craft_result(&d, &manual), craft_result(&d, &low), "the same qualities, the same result");
+        let typed = with_quality(&d, &manual, 0, 1000);
+        assert_eq!(craft_result(&d, &typed)[0], "Recoil Kick ×0.90");
+        assert_eq!(with_quality(&d, &manual, 0, 12).slots[0].quality, 400, "never below the minimum");
+        assert_eq!(with_quality(&d, &manual, 0, 5000).slots[0].quality, 1000, "never above the top");
+        // Back on the tiers: the tier holding the typed quality, or the nearest.
+        let back = with_manual(&d, &with_quality(&d, &manual, 0, 650), false);
+        assert_eq!((back.manual, back.slots[0].stop), (false, 1));
+        let gap = with_manual(&d, &with_quality(&d, &manual, 0, 760), false);
+        assert_eq!(gap.slots[0].stop, 2, "760 is in no band: the nearest (800-899)");
+        // Another material keeps the quality reached.
+        let iron = with_option(&d, &st, 0, 1);
+        assert_eq!(iron.slots[0], SlotChoice { option: 1, stop: 0, quality: 852 });
+        assert_eq!(craft_result(&d, &iron)[0], "Recoil Kick ×0.93", "no tiers: the quality typed");
+        let back = with_option(&d, &with_quality(&d, &iron, 0, 610), 0, 0);
+        assert_eq!(back.slots[0], SlotChoice { option: 0, stop: 1, quality: 610 });
+        assert_eq!(with_option(&d, &st, 0, 9), st, "no such option: nothing changes");
+        assert_eq!(with_option(&d, &st, 9, 0), st);
+    }
+
+    #[test]
+    fn ready_when_every_material_in_use_is_there() {
+        let d = detail();
+        let st = CraftState::start(&d);
+        assert!(craft_ready(&d, &st), "Agricium 2 / 1.25 SCU, Gem 3 / 2");
+        assert!(!craft_ready(&d, &with_option(&d, &st, 0, 1)), "Iron 1 / 4");
+        assert!(!craft_ready(&BlueprintDetail::default(), &CraftState::default()), "no material at all");
+        let mut lines = detail();
+        for i in 0..12 {
+            lines.slots[1].effects.push(QualityEffect { key: format!("P{i}"), name: Some(format!("P{i}")), ranges: vec![QualityRange { kind: QualityRangeKind::Linear, start_quality: 0, end_quality: 1000, at_start: 1.0, at_end: 1.0 }] });
+        }
+        assert_eq!(craft_result(&lines, &CraftState::start(&lines)).len(), RESULT_LINES, "at most 8 lines");
+    }
+
+    #[test]
+    fn result_lines_are_bounded_and_signed() {
+        let effect = |name: &str, kind: QualityRangeKind, at: f64| QualityEffect { key: name.into(), name: Some(name.into()), ranges: vec![QualityRange { kind, start_quality: 0, end_quality: 1000, at_start: at, at_end: at }] };
+        let slot = CraftSlot {
+            name: "S".into(),
+            options: vec![CraftOption { name: "Iron".into(), ..Default::default() }],
+            effects: vec![
+                effect("Neg", QualityRangeKind::Linear, -2.0),
+                effect("Zero", QualityRangeKind::Linear, -0.0),
+                effect("Spread", QualityRangeKind::Linear, 1.054),
+                effect("Down", QualityRangeKind::IntegerAdditive, -1.4),
+                effect("Flat", QualityRangeKind::IntegerAdditive, 0.0),
+                QualityEffect { key: "none".into(), name: None, ranges: vec![] },
+            ],
+        };
+        let d = BlueprintDetail { slots: vec![slot], ..Default::default() };
+        assert_eq!(craft_result(&d, &CraftState::start(&d)), vec!["Neg ×0.00", "Zero ×0.00", "Spread ×1.05", "Down -1", "Flat +0"], "never below 0, never -0, 2 decimals, whole and signed; no range: no line");
+    }
+
+    #[test]
+    fn craft_times_read_like_durations() {
+        assert_eq!(craft_time(45.0).as_deref(), Some("45 s"));
+        assert_eq!(craft_time(150.0).as_deref(), Some("2 min 30 s"));
+        assert_eq!(craft_time(125.0).as_deref(), Some("2 min 05 s"));
+        assert_eq!(craft_time(120.0).as_deref(), Some("2 min"));
+        assert_eq!(craft_time(3900.0).as_deref(), Some("1 h 05 min"));
+        assert_eq!(craft_time(3600.0).as_deref(), Some("1 h"));
+        assert_eq!(craft_time(3629.0).as_deref(), Some("1 h"), "from an hour on, to the nearest minute");
+        assert_eq!(craft_time(3631.0).as_deref(), Some("1 h 01 min"));
+        assert_eq!(craft_time(3599.4).as_deref(), Some("59 min 59 s"));
+        assert_eq!(craft_time(0.2).as_deref(), Some("1 s"), "never 0 s");
+        for none in [0.0, -5.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(craft_time(none), None, "{none}");
+        }
+    }
+
+    #[test]
+    fn huge_or_broken_craft_times_never_overflow() {
+        // Bounded at 10 000 000 s: 166 667 minutes once rounded, 2777 h 47 min.
+        assert_eq!(craft_time(1e300).as_deref(), Some("2777 h 47 min"));
+        assert_eq!(craft_time(f64::MAX).as_deref(), Some("2777 h 47 min"));
+        assert_eq!(craft_time(MAX_CRAFT_SECS).as_deref(), Some("2777 h 47 min"));
+        for none in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1e300, -1.0] {
+            assert_eq!(craft_time(none), None, "{none}");
+        }
+    }
+
+    #[test]
+    fn material_quantities_read_in_their_unit() {
+        assert_eq!(material_qty(1.25, true), "1.25");
+        assert_eq!(material_qty(0.5, true), "0.5");
+        assert_eq!(material_qty(3.0, true), "3");
+        assert_eq!(material_qty(0.3333, true), "0.33", "up to 2 decimals");
+        assert_eq!(material_qty(0.001, true), "0");
+        assert_eq!(material_qty(4.0, false), "4");
+        assert_eq!(material_qty(2.6, false), "3", "units are whole");
+        assert_eq!(material_qty(-1.0, true), "0");
+        assert_eq!(material_qty(-0.0, true), "0");
+        assert_eq!(material_qty(f64::NAN, false), "0");
+        // Through the detail's parser, so the unit is read as the route sends it.
+        let m = |need: f64, unit: &str, have: f64, min_quality: f64| {
+            let body = serde_json::json!({ "slots": [ { "name": "S", "options": [ { "name": "Iron", "need": need, "unit": unit, "have": have, "minQuality": min_quality } ] } ] });
+            parse_blueprint_detail(body.to_string().as_bytes()).unwrap().slots[0].options[0].clone()
+        };
+        assert_eq!(material_amount(&m(1.25, "scu", 0.5, 0.0)), "0.5 / 1.25 SCU");
+        assert_eq!(material_amount(&m(1.25, " SCU ", 0.5, 0.0)), "0.5 / 1.25 SCU", "the unit read loosely");
+        assert_eq!(material_amount(&m(4.0, "unit", 3.0, 0.0)), "3 / 4 un.");
+        assert_eq!(material_amount(&m(4.0, "", 3.0, 0.0)), "3 / 4 un.", "anything but SCU counts units");
+        assert!(material_short(&m(1.25, "scu", 0.5, 0.0)));
+        assert!(!material_short(&m(1.0, "scu", 0.999, 0.0)), "drawn 1 / 1 SCU: not short");
+        assert!(material_short(&m(1.0, "scu", 0.99, 0.0)));
+        assert!(!material_short(&m(4.0, "unit", 5.0, 0.0)));
+        assert!(material_short(&m(4.0, "unit", 3.0, 0.0)));
+        assert!(!material_short(&m(0.0, "unit", 0.0, 0.0)), "nothing needed");
+        assert_eq!(material_label(&m(1.0, "scu", 0.0, 500.0)), "Iron · qualidade ≥ 500");
+        assert_eq!(material_label(&m(1.0, "scu", 0.0, 0.0)), "Iron", "no minimum: just the name");
+        assert_eq!(material_label(&m(1.0, "scu", 0.0, -3.0)), "Iron");
     }
 
     #[test]
@@ -2431,5 +3961,122 @@ mod tests {
         assert_eq!(name("Pyro2_derelict_occ_005"), "Derelict Outpost", "alone on its body");
         assert_eq!((name("Stanton2_Orison"), name("Stanton2_Orison_Hab")), ("Orison".to_string(), "Orison (Orison Hab)".to_string()), "the visible one stays clean");
         assert_eq!(name("Pyro_Mission_A"), "Mission A");
+    }
+
+    #[test]
+    fn a_source_reads_its_contract_and_its_pool_chance_within_bounds() {
+        let body = serde_json::json!({
+            "sources": [
+                { "title": "Resources For Research", "giver": "Rayari", "when": "complete", "chance": 0.0178, "contractId": "rayari_research_01", "poolChance": 0.25 },
+                { "title": "Bounty", "when": "accept", "chance": 0.07, "contractId": "c-2", "poolChance": 1 },
+                { "title": "Odd", "contractId": "a/b", "poolChance": "NaN" },
+                { "title": "Long", "contractId": "k".repeat(MAX_CONTRACT_CHARS + 1), "poolChance": -3 },
+                { "title": "Control", "contractId": "a\u{7}b", "poolChance": 7 },
+                { "title": "Blank", "contractId": "  ", "poolChance": 0.996 },
+                { "title": "Number", "contractId": 42 }
+            ]
+        });
+        let d = parse_blueprint_detail(body.to_string().as_bytes()).unwrap();
+        let read: Vec<(Option<&str>, Option<f64>)> = d.sources.iter().map(|s| (s.contract_id.as_deref(), s.pool_chance)).collect();
+        assert_eq!(
+            read,
+            vec![(Some("rayari_research_01"), Some(0.25)), (Some("c-2"), None), (None, None), (None, Some(0.0)), (None, None), (None, Some(0.996)), (None, None)],
+            "1 or more: always gives one; not a number: none; below 0: 0; an id the route refuses: none, never cut"
+        );
+        assert!(contract_usable(&"é".repeat(MAX_CONTRACT_CHARS)), "counted in characters");
+        assert!(!contract_usable(""));
+        // The lines: no percentage but the one of a reward that does not always give one.
+        let lines: Vec<String> = d.sources.iter().map(mission_line).collect();
+        assert_eq!(lines[0], "Resources For Research · Rayari · ao concluir · nem sempre entrega (25%)");
+        assert_eq!(lines[1], "Bounty · ao aceitar");
+        assert_eq!(lines[3], "Long · nem sempre entrega (0%)");
+        assert_eq!(lines[5], "Blank · nem sempre entrega (99%)", "never 100% under a sentence that says it is not always");
+        assert_eq!(not_always_text(0.004), "nem sempre entrega (<1%)");
+        assert_eq!(never_twice_note(), "Uma blueprint nunca é entregue duas vezes.");
+        // An older server: no contract, no pool chance; the line opens nothing and notes nothing.
+        let old = parse_blueprint_detail(br#"{"sources":[{"title":"T","when":"complete","chance":0.5}]}"#).unwrap();
+        assert_eq!((old.sources[0].contract_id.as_deref(), old.sources[0].pool_chance, mission_line(&old.sources[0]).as_str()), (None, None, "T · ao concluir"));
+    }
+
+    #[test]
+    fn the_facts_are_bounded_and_drawn_on_one_line_with_their_labels_translated() {
+        let long = "v".repeat(MAX_FACT_CHARS + 30);
+        let body = serde_json::json!({
+            "facts": [
+                { "label": "Type", "value": "WeaponGun / Gun" },
+                { "label": "Size", "value": "S2" },
+                { "label": "Grade", "value": 1 },
+                { "label": "Class", "value": " " },
+                { "label": "Manufacturer", "value": "Behring" },
+                { "label": "Mass", "value": long },
+                7,
+                { "label": "", "value": "x" },
+                { "label": "A", "value": "1" }, { "label": "B", "value": "2" }, { "label": "C", "value": "3" }, { "label": "D", "value": "4" }
+            ]
+        });
+        let d = parse_blueprint_detail(body.to_string().as_bytes()).unwrap();
+        assert_eq!(d.facts.len(), MAX_FACTS, "at most 8; empty ones and odd entries left out");
+        assert_eq!(d.facts[2], Fact { label: "Grade".into(), value: "1".into() }, "a number reads as its text");
+        assert_eq!(d.facts[4].value.chars().count(), MAX_FACT_CHARS, "cut");
+        assert!(d.facts.iter().all(|f| f.label != "Class"), "a blank value is no fact");
+        let shown = facts_line(&d.facts[..4]).unwrap();
+        assert_eq!(shown, "Tipo WeaponGun / Gun · Tamanho S2 · Grau 1 · Fabricante Behring");
+        assert_eq!([fact_label("Class"), fact_label("Mass"), fact_label("type")], ["Classe", "Mass", "type"], "exact match only; an unknown label as sent");
+        // An older server: none.
+        assert!(detail().facts.is_empty());
+        assert_eq!(facts_line(&[]), None);
+        let odd = parse_blueprint_detail(br#"{"facts":"x"}"#).unwrap();
+        assert!(odd.facts.is_empty());
+    }
+
+    const MISSION: &str = r#"{
+      "title": "Resources For Research", "giver": "Rayari",
+      "pools": [
+        { "when": "accept", "total": 2, "acquired": 2,
+          "blueprints": [ { "blueprint": "BP_a", "name": "Arm", "kind": "Armour", "acquired": true },
+                          { "blueprint": "BP_d", "name": "", "kind": "Weapon", "acquired": false, "default": true } ] },
+        { "when": "complete", "poolChance": 0.25, "total": 14, "acquired": 3,
+          "blueprints": [ { "blueprint": "BP_b", "name": "Blade", "kind": "  Melee  ", "acquired": false },
+                          { "blueprint": "", "name": "no key" } ] }
+      ],
+      "somethingNew": 1
+    }"#;
+
+    #[test]
+    fn reads_the_blueprints_of_a_mission_and_words_its_pools() {
+        let m = parse_mission_blueprints(MISSION.as_bytes()).unwrap();
+        assert_eq!((m.title.as_str(), m.giver.as_deref(), m.pools.len()), ("Resources For Research", Some("Rayari"), 2));
+        let (accept, complete) = (&m.pools[0], &m.pools[1]);
+        assert_eq!((accept.when, accept.pool_chance, accept.total, accept.acquired), (Some(When::Accept), None, 2, 2));
+        assert_eq!(accept.blueprints[1].name, "BP_d", "no name: its key");
+        assert_eq!(accept.blueprints.iter().map(PoolBlueprint::have).collect::<Vec<_>>(), vec![BpHave::Have, BpHave::Default], "a default one counts as had");
+        assert_eq!((complete.pool_chance, complete.blueprints.len(), complete.blueprints[0].kind.as_str()), (Some(0.25), 1, "Melee"), "a row without a key dropped");
+        assert_eq!(pool_heading(accept), "ao aceitar · 2 de 2 adquiridas");
+        assert_eq!(pool_notes(accept), vec!["Todas adquiridas: esta missão não entrega mais nenhuma.".to_string()]);
+        assert_eq!(pool_heading(complete), "ao concluir · 3 de 14 adquiridas");
+        assert_eq!(pool_notes(complete), vec!["nem sempre entrega (25%)".to_string()]);
+        assert_eq!(mission_screen_title(), "Blueprints da missão");
+        // A pool of an unknown moment and an empty one say no more than they know.
+        let p = MissionPool { total: 0, acquired: 0, ..Default::default() };
+        assert_eq!((pool_heading(&p), pool_notes(&p)), ("0 de 0 adquiridas".to_string(), Vec::<String>::new()));
+    }
+
+    #[test]
+    fn a_hostile_mission_answer_is_bounded_and_never_breaks() {
+        assert!(parse_mission_blueprints(b"[]").is_err() && parse_mission_blueprints(b"<html>").is_err());
+        assert_eq!(parse_mission_blueprints(b"{}").unwrap(), MissionBlueprints::default());
+        let long = "x".repeat(MAX_CHARS + 50);
+        let bp = serde_json::json!({ "blueprint": "BP_x", "name": long, "kind": long, "acquired": "yes", "default": 1 });
+        let pool = serde_json::json!({ "when": "later", "poolChance": 1e300, "total": -4, "acquired": 1e300, "blueprints": vec![bp; MAX_POOL_BLUEPRINTS + 50] });
+        let body = serde_json::json!({ "title": long, "giver": " ", "pools": vec![pool; MAX_POOLS + 5] });
+        let m = parse_mission_blueprints(body.to_string().as_bytes()).unwrap();
+        assert_eq!((m.title.chars().count(), m.giver.as_deref(), m.pools.len()), (MAX_CHARS, None, MAX_POOLS), "a blank giver is none");
+        let p = &m.pools[0];
+        assert_eq!((p.when, p.pool_chance, p.blueprints.len()), (None, None, MAX_POOL_BLUEPRINTS));
+        assert_eq!((p.total, p.acquired), (MAX_POOL_BLUEPRINTS as u64, MAX_POOL_BLUEPRINTS as u64), "never fewer in all than listed, never more acquired than in all");
+        let b = &p.blueprints[0];
+        assert_eq!((b.name.chars().count(), b.kind.chars().count(), b.acquired, b.is_default), (MAX_CHARS, MAX_KIND_CHARS, false, false), "odd flags read as false");
+        let odd = parse_mission_blueprints(br#"{"title":7,"pools":{"a":1}}"#).unwrap();
+        assert_eq!(odd, MissionBlueprints::default());
     }
 }

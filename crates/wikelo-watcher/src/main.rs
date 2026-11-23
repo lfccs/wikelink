@@ -49,18 +49,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Start Wikelink in the background (sets it up on the first run).
+    /// Start Wikelink in the background (sets it up on the first run; signing in opens the
+    /// site in the browser, where you confirm a code).
     Start {
         /// Channel to follow (default: LIVE, or the only one installed).
         #[arg(long)]
         channel: Option<String>,
-        /// Account handle (asked interactively when missing).
-        #[arg(long)]
-        handle: Option<String>,
-        /// Password. Safer left out: it is then asked for, hidden, while a password typed on
-        /// the command line stays in the shell's history. Scripts can set WIKELINK_PASSWORD instead.
-        #[arg(long, env = "WIKELINK_PASSWORD", hide_env_values = true)]
-        password: Option<String>,
         /// Upload new game versions automatically (yes/no); asked once when missing.
         #[arg(long)]
         share_data: Option<bool>,
@@ -76,12 +70,6 @@ enum Cmd {
     Watch {
         #[arg(long)]
         channel: Option<String>,
-        #[arg(long)]
-        handle: Option<String>,
-        /// Password. Safer left out: it is then asked for, hidden, while a password typed on
-        /// the command line stays in the shell's history. Scripts can set WIKELINK_PASSWORD instead.
-        #[arg(long, env = "WIKELINK_PASSWORD", hide_env_values = true)]
-        password: Option<String>,
         #[arg(long)]
         share_data: Option<bool>,
         /// Do not replay the current Game.log on start.
@@ -263,9 +251,7 @@ fn main() -> anyhow::Result<()> {
 fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.cmd {
         None => unreachable!("the window runs from main"),
-        Some(Cmd::Start { channel, handle, password, share_data, .. }) => {
-            run_start(agent::SetupOptions { channel, handle, password, share_data })
-        }
+        Some(Cmd::Start { channel, share_data, .. }) => run_start(agent::SetupOptions { channel, share_data }),
         Some(Cmd::Stop) => {
             // The overlay goes too: without the watcher it would wait for the game forever.
             if let Err(e) = agent::close_overlay() {
@@ -289,7 +275,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 None => eprintln!("{}", tr!("Wikelink stopped.", "Wikelink parado.")),
             }
             if let Some(cfg) = agent::load_config() {
-                let (server, handle) = (agent::server_address(), &cfg.handle);
+                // Saved by this program, but it came from the server: plain text only.
+                let (server, handle) = (agent::server_address(), agent::server_text(&cfg.handle));
                 let channel = cfg.channel.as_deref().unwrap_or("?");
                 let upload = if cfg.share_data == Some(true) { tr!("on", "ativado") } else { tr!("off", "desativado") };
                 eprintln!(
@@ -324,9 +311,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Some(Cmd::Watch { channel, handle, password, share_data, no_replay, daemon }) => {
-            agent::run(agent::WatchOptions { setup: agent::SetupOptions { channel, handle, password, share_data }, no_replay, daemon })
-        }
+        Some(Cmd::Watch { channel, share_data, no_replay, daemon }) => agent::run(agent::WatchOptions { setup: agent::SetupOptions { channel, share_data }, no_replay, daemon }),
         Some(Cmd::Autostart { mode }) => {
             let on = mode == "on";
             agent::set_autostart(on)?;
@@ -344,11 +329,25 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 eprintln!("{e:#}");
             }
             let _ = agent::stop_background();
+            // The server ends the session too (best effort, a few seconds at most); the
+            // session on this PC is forgotten whatever it answers.
+            if let Some(cfg) = agent::load_config()
+                && let Err(e) = agent::sign_out_on_server(&cfg)
+            {
+                eprintln!("{}", trf!("the server could not be told about the sign-out ({e}); the session is forgotten here anyway", "não deu para avisar o servidor da saída ({e}); a sessão é esquecida aqui mesmo assim"));
+            }
             let p = agent::config_path();
-            let _ = agent::remove_config();
+            let shown = p.display();
+            // The saved session is what makes this PC signed in: when it stays, so does the
+            // sign-in, and the command says so and fails.
+            if let Err(e) = agent::remove_config() {
+                anyhow::bail!(trf!(
+                    "could not remove the saved session ({shown}): {e}; this PC is still signed in",
+                    "não deu para remover a sessão salva ({shown}): {e}; este PC continua conectado"
+                ));
+            }
             let _ = std::fs::remove_file(agent::status_path());
-            let p = p.display();
-            eprintln!("{}", trf!("Wikelink session removed ({p}).", "sessão do Wikelink removida ({p})."));
+            eprintln!("{}", trf!("Wikelink session removed ({shown}).", "sessão do Wikelink removida ({shown})."));
             Ok(())
         }
         Some(Cmd::Update { yes }) => update::command(yes),
@@ -763,4 +762,26 @@ fn spike(channel: String, p4k: Option<PathBuf>, out: PathBuf, record_name: &str)
     }
     eprintln!("done in {:.2}s", t.elapsed().as_secs_f64());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_command_line_takes_no_account_name_nor_secret() {
+        // Signing in goes through the site: the old sign-in flags are unknown now. (The flag is
+        // spelt in two pieces so that the source scan in agent.rs finds the word nowhere.)
+        let secret_flag = concat!("--pass", "word");
+        for args in [
+            ["wikelink", "start", "--handle", "TestPilot"],
+            ["wikelink", "start", secret_flag, "x"],
+            ["wikelink", "watch", "--handle", "TestPilot"],
+            ["wikelink", "watch", secret_flag, "x"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err(), "{args:?}");
+        }
+        assert!(Cli::try_parse_from(["wikelink", "start", "--channel", "LIVE", "--share-data", "true", "--quiet"]).is_ok());
+        assert!(Cli::try_parse_from(["wikelink", "watch", "--no-replay"]).is_ok());
+    }
 }

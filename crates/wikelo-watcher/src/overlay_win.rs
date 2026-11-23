@@ -10,9 +10,12 @@
 //! or injects into another process. No key press or mouse movement is ever synthesized: that
 //! is also why the overlay never uses egui's `ViewportCommand::Focus`, which on Windows makes
 //! winit send a fake Alt press to get around the foreground rules, and that press would land
-//! in the game. The one input event this process sends is an empty one (a mouse event with
-//! no movement and no button), and only when Windows refused to bring the overlay to the
-//! front on Shift+Tab (see [`take_focus`]).
+//! in the game. The one input event this process sends is an empty one: a synthetic mouse
+//! event with no movement, no button and no wheel, sent with `SendInput`. Like any input it
+//! goes through the system's input stream, and programs that watch input see it marked as
+//! injected. It is sent only after Windows refused to bring the overlay to the front on
+//! Shift+Tab (see [`take_focus`]); it is not sent to the game's process, and nothing is
+//! written to or read from that process.
 //!
 //! Elsewhere every call is a no-op that answers "unknown".
 
@@ -336,10 +339,12 @@ mod win {
 
     /// Bring the overlay to the foreground (it opened) and say whether it got there, with the
     /// window that had the focus, to hand it back on close. Windows lets a background process
-    /// do this only in some cases (it got the last input, e.g. the WM_HOTKEY). After a refusal
-    /// one empty input event is sent ([`empty_input`]) and the request made once more; a
-    /// second refusal is final: the caller stays closed and says so. Nothing is done to the other window's
-    /// thread to force the switch (no AttachThreadInput: the game runs under an anti-cheat).
+    /// do this only in some cases. Only after Windows refused the first request is one empty
+    /// input event sent ([`empty_input`]) and the request made once more; in the tests done,
+    /// that event is what makes Windows accept the second request. A second refusal is
+    /// final: the caller stays closed and says so. Nothing is done to the other window's
+    /// thread to force the switch (no AttachThreadInput: the game runs under an anti-cheat),
+    /// and nothing is sent to, written to or read from the game's process.
     /// Without its own window (`None`) nothing is tried and the answer is "not in front".
     pub fn take_focus(w: Option<Window>) -> FocusTaken {
         let Some(w) = w else { return FocusTaken { ok: false, prev: None, detail: "own window not found".into() } };
@@ -358,9 +363,7 @@ mod win {
         // SAFETY: no arguments; this thread's error code.
         let err = unsafe { GetLastError() };
         let mut ok = is_foreground(w);
-        // Refused: the player's key went to the window in front, so this process did not get
-        // the last input. One empty input event of its own makes it the last one, and the
-        // same request is made once more.
+        // Refused: one empty input event (see `empty_input`), then the same request once more.
         let mut second = String::new();
         if !ok {
             let sent = empty_input();
@@ -380,10 +383,13 @@ mod win {
         FocusTaken { ok, prev, detail }
     }
 
-    /// One empty input event from this process: a mouse event with no movement, no button
-    /// and no wheel. It moves and presses nothing; it only makes this process the one the
-    /// last input came from, which is what Windows asks of a background process before it
-    /// may bring its own window to the front. Says whether the system took the event.
+    /// One empty input event: a synthetic mouse event with no movement, no button and no
+    /// wheel, sent with `SendInput`. Like any input it goes through the system's input
+    /// stream, and programs that watch input see it marked as injected. It moves and presses
+    /// nothing. [`take_focus`] sends it only after Windows refused to bring the overlay to the
+    /// front; in the tests done, it is what makes Windows accept the next request. It is not
+    /// sent to the game's process, and nothing is written to or read from that process. Says
+    /// whether the system took the event.
     fn empty_input() -> bool {
         // SAFETY: INPUT is plain data and all zeroes is a valid value of it: type 0 is
         // INPUT_MOUSE, with zero movement and no flags.
@@ -393,9 +399,11 @@ mod win {
         unsafe { SendInput(1, &input, std::mem::size_of::<INPUT>() as i32) == 1 }
     }
 
-    /// A window for `overlay.log`: handle, owner process and thread, class and the first
-    /// characters of the title, with a mark when it is the game's or this process's own.
-    /// Window-manager queries only; nothing is sent to the window.
+    /// A window for `overlay.log`. This process's own: its handle. The game's (titled
+    /// [`GAME_TITLE`]): handle, owner process and thread, class and title. Any other
+    /// program's window: only its class name and that it is another program; its title is
+    /// read to tell it from the game's but never written. Window-manager queries only;
+    /// nothing is sent to the window.
     fn describe(hwnd: HWND) -> String {
         if hwnd == 0 {
             return "none".into();
@@ -409,9 +417,11 @@ mod win {
         // many and returns how many characters it copied (0 for a stale handle).
         let n = unsafe { GetClassNameW(hwnd, class.as_mut_ptr(), class.len() as i32) };
         let class = String::from_utf16_lossy(&class[..usize::try_from(n).unwrap_or(0).min(class.len())]);
-        let title = short_title(hwnd);
-        let game = if title.trim() == GAME_TITLE { " (the game)" } else { "" };
-        format!("{hwnd:#x} pid={pid} thread={thread} class={class:?} title={title:?}{game}")
+        if short_title(hwnd).trim() == GAME_TITLE {
+            format!("{hwnd:#x} pid={pid} thread={thread} class={class:?} title={GAME_TITLE:?} (the game)")
+        } else {
+            format!("class={class:?} (another program)")
+        }
     }
 
     /// This process's own window for `overlay.log`: its extended style (click-through,

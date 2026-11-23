@@ -3,6 +3,7 @@
 //! (missing items, "can complete now", progress).
 
 pub mod compute;
+pub mod craft;
 pub mod dataset;
 pub mod history;
 pub mod validate;
